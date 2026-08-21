@@ -30,9 +30,15 @@ set -eu
 FX="${1:-./fxstore}"
 # Resolve to an absolute path: the test cds into a temp project dir later.
 FX="$(cd "$(dirname "$FX")" && pwd)/$(basename "$FX")"
-WORK="$(mktemp -d /tmp/fxstore-sandboxed.XXXXXX)"
-STORE="$WORK/store"
-PROJ="$WORK/proj"
+# stage3 path (the inner sandbox binary) — sibling of fxstore in the repo.
+FXSTAGE3="$(dirname "$FX")/vendor/palisade/bin/stage3"
+# Short temp base: the LANDLOCK_SPEC (unveiling store + real-path workdir +
+# toolchain) is capped at stage3's 256-byte budget, and a deep mktemp path
+# (e.g. /tmp/fxstore-sandboxed.XXXXXX/store...) can push it over.  Use a
+# short /tmp base so the spec fits (mirrors real usage at /fx/store).
+WORK="$(mktemp -d /tmp/fx.XXXXXX)"
+STORE="$WORK/s"
+PROJ="$WORK/p"
 SHIMDIR="$WORK/shim"
 LOG="$WORK/argv.log"     # every bwrap argv word, one per line, all invocations
 ENVLOG="$WORK/env.log"   # the child env at exec time
@@ -84,12 +90,17 @@ for a in "$@"; do
 done
 printf '%s\n' '===END===' >> "$DIR/argv.log"
 env >> "$DIR/env.log"
+# the shim is a mock bwrap: it records the argv, then must run the REAL
+# command the sandbox would run.  With stage3, the argv after the first `--`
+# is [stage3 PROMISES SPEC -- cmd...]; the shim skips past the stage3 wrapper
+# (which it cannot run) to the actual recipe command after the second `--`.
 workdir=
 prev=
 for a in "$@"; do
     if [ "$prev" = "--bind" ]; then workdir="$a"; fi
     prev="$a"
 done
+# find the LAST `--` and run everything after it (the recipe command)
 lastsep=0
 n=0
 for a in "$@"; do
@@ -115,11 +126,16 @@ if grep -q 'NON-HERMETIC' "$WORK/build1.out"; then
     fail "shim not used: the bwrap-absent fallback was taken"
 fi
 
-# required argv words (exact lines)
+# required argv words (exact lines).  stage3 is bound+exec'd at its REAL host
+# path (the ro-bound root can't host a synthesized /init mountpoint), so we
+# assert the stage3 path appears rather than a fixed /init.
 for w in --unshare-all --die-with-parent --uid --gid 1000 --tmpfs /tmp \
-         --ro-bind --bind --chdir --dev /dev --proc /proc /init; do
+         --ro-bind --bind --chdir --dev /dev --proc /proc; do
     grep -qx -e "$w" "$LOG" || fail "bwrap argv lacks '$w'"
 done
+if ! grep -qx -e "$FXSTAGE3" "$LOG"; then
+    fail "bwrap argv lacks the stage3 path ($FXSTAGE3)"
+fi
 
 # --tmpfs /tmp must PRECEDE the store/src/workdir binds: bwrap applies mount
 # ops in argv order, so a tmpfs pushed AFTER those binds would shadow any
@@ -159,15 +175,19 @@ if awk -v build="$STORE.build/" '
 else
     fail "rw --bind source is not the scratch dir under '$STORE.build/'"
 fi
-# the workdir bind dest must be the short fixed path (keeps the
-# LANDLOCK_SPEC inside stage3's 256-byte budget; cannot be shadowed)
-awk 'prev2 == "--bind" && $0 != "/build" { bad = 1 }   # --bind SRC DEST
-     prev  == "--chdir" && $0 != "/build" { bad = 1 }  # --chdir DEST
-     { prev2 = prev; prev = $0 }
-     END { exit bad ? 1 : 0 }' "$LOG" \
-    || fail "--bind/--chdir dest is not the fixed /build mountpoint"
+# the workdir bind dest == its source (real host path): under the ro-bound
+# root bwrap cannot synthesize a /build mountpoint, so the scratch dir is
+# bound at its real path and --chdir there (portable across kernels).
+# Extract the --bind SRC DEST triple and the --chdir DEST, assert equality.
+# the bind SRC is the first line after a --bind whose content has the store.build path
+BIND_SRC="$(awk -v b="$STORE.build/" 'prev=="--bind" && index($0,b)==1{print;exit}{prev=$0}' "$LOG")"
+[ -n "$BIND_SRC" ] || fail "no --bind of the scratch dir ($STORE.build/) in argv"
+BIND_DEST="$(awk -v s="$BIND_SRC" 'prev=="--bind" && $0==s{getline;print;exit}{prev=$0}' "$LOG")"
+CHDIR_DEST="$(awk 'prev=="--chdir"{print;exit}{prev=$0}' "$LOG")"
+[ "$BIND_SRC" = "$BIND_DEST" ] || fail "--bind workdir dest ($BIND_DEST) != source ($BIND_SRC)"
+[ "$BIND_SRC" = "$CHDIR_DEST" ] || fail "--chdir dest ($CHDIR_DEST) != workdir bind source ($BIND_SRC)"
 
-# LANDLOCK_SPEC: one argv word, '<store>:r;...;/build:rwcx;...'
+# LANDLOCK_SPEC: one argv word, '<store>:r;...;<workdir>:rwcx;...'
 SPECLINE="$(grep -F "${STORE}:" "$LOG" | grep -F ':rwcx' | head -n1)"
 [ -n "$SPECLINE" ] || fail "LANDLOCK_SPEC word missing (needs '<store>:r' + ':rwcx', colon-separated)"
 case "$SPECLINE" in
@@ -175,12 +195,8 @@ case "$SPECLINE" in
     *) fail "LANDLOCK_SPEC does not start with '${STORE}:r;': $SPECLINE" ;;
 esac
 case "$SPECLINE" in
-    *"/build:rwcx"*) : ;;
-    *) fail "LANDLOCK_SPEC lacks the '/build:rwcx' workdir entry: $SPECLINE" ;;
-esac
-case "$SPECLINE" in
-    *"${STORE}.build/"*)
-        fail "LANDLOCK_SPEC carries the long host workdir path (eats stage3's 256-byte budget): $SPECLINE" ;;
+    *"${STORE}.build/"*":rwcx"*) : ;;
+    *) fail "LANDLOCK_SPEC lacks the real workdir ':rwcx' entry: $SPECLINE" ;;
 esac
 SPECFULL=";$SPECLINE;"
 for entry in "/usr:rx" "/bin:rx" "/lib:rx" "/dev:rwc" "/proc:r" "/tmp:rwc"; do
@@ -193,9 +209,9 @@ case "$SPECFULL" in
     *";/:r;"*) fail "LANDLOCK_SPEC leaks '/:r' (whole host fs read): $SPECLINE" ;;
 esac
 
-# /init positional ABI: bwrap's '--' then '/init' PROMISES SPEC '--' cmd
-grep -A1 -e '^--$' "$LOG" | grep -q '^/init$' \
-    || fail "bwrap '--' is not followed by /init (stage3 positional ABI)"
+# stage3 positional ABI: bwrap's '--' then <stage3-path> PROMISES SPEC '--' cmd
+grep -A1 -e '^--$' "$LOG" | grep -qx -e "$FXSTAGE3" \
+    || fail "bwrap '--' is not followed by the stage3 path (positional ABI)"
 grep -qx -e 'stdio rpath wpath cpath dpath flock fattr exec prot_exec proc recvfd' "$LOG" \
     || fail "PROMISES word missing or wrong"
 grep -qx -e '/bin/sh' "$LOG" || fail "real command /bin/sh missing after the last '--'"
