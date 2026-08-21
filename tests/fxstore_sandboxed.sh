@@ -121,13 +121,19 @@ for w in --unshare-all --die-with-parent --uid --gid 1000 --tmpfs /tmp \
     grep -qx -e "$w" "$LOG" || fail "bwrap argv lacks '$w'"
 done
 
-# --tmpfs /tmp must PRECEDE the first bind: bwrap applies mount ops in argv
-# order, so a tmpfs pushed after the binds would shadow any store/src/
-# workdir placed under /tmp (the exact "Can't chdir ... No such file" bug).
+# --tmpfs /tmp must PRECEDE the store/src/workdir binds: bwrap applies mount
+# ops in argv order, so a tmpfs pushed AFTER those binds would shadow any
+# store/src/workdir placed under /tmp (the exact "Can't chdir ... No such
+# file" bug).  The `--ro-bind / /` root bind (if present) correctly comes
+# BEFORE the tmpfs: binding / brings the host tree in, then the tmpfs shadows
+# host /tmp, and a later bind whose dest falls under /tmp auto-creates its
+# mountpoint inside the fresh tmpfs (verified) — so only the store/src/workdir
+# binds must follow the tmpfs.
 TMPFS_LINE="$(grep -n '^--tmpfs$' "$LOG" | head -n1 | cut -d: -f1)"
-FIRST_BIND="$(grep -n '^--ro-bind$\|^--bind$' "$LOG" | head -n1 | cut -d: -f1)"
 [ -n "$TMPFS_LINE" ] || fail "no --tmpfs in bwrap argv"
-[ -n "$FIRST_BIND" ] || fail "no bind mounts in bwrap argv"
+# first bind AFTER the tmpfs (skip a leading `--ro-bind / /` root bind)
+FIRST_BIND="$(awk -v t="$TMPFS_LINE" 'NR>t && ($0=="--ro-bind" || $0=="--bind"){print NR; exit}' "$LOG")"
+[ -n "$FIRST_BIND" ] || fail "no bind mounts after --tmpfs in bwrap argv"
 [ "$TMPFS_LINE" -lt "$FIRST_BIND" ] \
     || fail "--tmpfs /tmp is pushed AFTER the binds — it would shadow stores under /tmp"
 
