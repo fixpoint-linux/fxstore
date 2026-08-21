@@ -92,6 +92,7 @@ typedef struct {
     Package *p;
     char *path;               /* store path of p */
     char *hash;               /* derivation sha256 (hex64) */
+    char *src_hash;           /* clean source hash (SRC_PATH), else NULL */
 } PathEntry;
 
 static const char *path_of(const PathEntry *es, int ne, const char *name) {
@@ -101,7 +102,11 @@ static const char *path_of(const PathEntry *es, int ne, const char *name) {
 }
 
 static void paths_free(PathEntry *es, int n) {
-    for (int i = 0; i < n; i++) { free(es[i].path); free(es[i].hash); }
+    for (int i = 0; i < n; i++) {
+        free(es[i].path);
+        free(es[i].hash);
+        free(es[i].src_hash);
+    }
     free(es);
 }
 
@@ -148,7 +153,24 @@ static int compute_paths(const PackageSet *ps, struct dl_db *db,
         }
         if (dep_ok) {
             char h[65], path[PATH_MAX];
-            if (fx_derivation_hash(p, dep_paths, p->ndeps, h, err, errcap) == 0) {
+            /* compute the CLEAN source hash ONCE (SRC_PATH only) and reuse it
+               for both the derivation hash and fx_store_ensure_source, so the
+               store path and the materialized src are provably the same
+               content (and the raw checkout is never walked twice) */
+            char *src_hash = NULL;
+            if (p->src.kind == SRC_PATH) {
+                char sh[65];
+                if (fx_content_hash_dir(p->src.path, sh, err, errcap) != 0) {
+                    rc = -1;
+                } else if (!(es[i].src_hash = strdup(sh))) {
+                    fx_err(err, errcap, "out of memory");
+                    rc = -1;
+                } else {
+                    src_hash = es[i].src_hash;
+                }
+            }
+            if (rc == 0 &&
+                fx_derivation_hash_ex(p, src_hash, dep_paths, p->ndeps, h, err, errcap) == 0) {
                 fx_store_path_of(store_root, h, p->name, path, sizeof path);
                 es[i].p = p;
                 es[i].hash = strdup(h);
@@ -157,7 +179,7 @@ static int compute_paths(const PackageSet *ps, struct dl_db *db,
                     fx_err(err, errcap, "out of memory");
                     rc = -1;
                 }
-            } else {
+            } else if (rc == 0) {
                 rc = -1;
             }
         }
@@ -226,9 +248,24 @@ static int cmd_build(char **argv, int argc, int start) {
             }
         }
         if (dep_ok) {
+            /* Materialize the CLEAN source into the store BEFORE building, so
+               the recipe reads (via FX_SRC) the same clean bytes the store
+               path was hashed from.  SRC_FETCH has no clean source: NULL. */
+            char src_path[PATH_MAX];
+            const char *clean_src = NULL;
+            if (p->src.kind == SRC_PATH) {
+                if (fx_store_ensure_source(s, p, es[i].src_hash, src_path,
+                                           sizeof src_path, err, sizeof err) != 0) {
+                    fprintf(stderr, "fxstore: clean source %s failed: %s\n", p->name, err);
+                    rc = 1;
+                    free(dep_paths);
+                    break;
+                }
+                clean_src = src_path;
+            }
             printf("fxstore: building %s\n", p->name);
-            if (fx_store_build(s, p, es[i].hash, es[i].path, p->deps,
-                               dep_paths, p->ndeps, err, sizeof err) != 0) {
+            if (fx_store_build(s, p, es[i].hash, es[i].path, clean_src,
+                               p->deps, dep_paths, p->ndeps, err, sizeof err) != 0) {
                 fprintf(stderr, "fxstore: build %s failed: %s\n", p->name, err);
                 rc = 1;
             } else {

@@ -747,7 +747,8 @@ static void env_restore(const EnvSnap *s) {
 
 int fx_build_recipe(const Package *p, const char *workdir,
                     char *const *dep_names, char *const *dep_paths, int ndeps,
-                    const char *store_root, char *err, size_t errcap) {
+                    const char *store_root, const char *src_path,
+                    char *err, size_t errcap) {
     if (!p || !workdir || !store_root) {
         fx_err(err, errcap, "internal: null args to fx_build_recipe");
         return -1;
@@ -758,8 +759,20 @@ int fx_build_recipe(const Package *p, const char *workdir,
 
     /* Path sources are mounted read-only into the sandbox at their own
        path; Fetch sources have no local tree (network is off in the
-       sandbox; fetching is post-MVP). */
-    const char *src_ro = (p->src.kind == SRC_PATH) ? p->src.path : NULL;
+       sandbox; fetching is post-MVP).  For SRC_PATH the source is the CLEAN
+       materialized artifact in the store (src_path, from
+       fx_store_ensure_source) — NOT the raw checkout, which is no longer
+       unveiled (a TIGHTENING). */
+    const char *src_ro = NULL;
+    if (p->src.kind == SRC_PATH) {
+        if (!src_path || !src_path[0]) {
+            env_restore(&snap);
+            env_snap_free(&snap);
+            return fx_err(err, errcap,
+                          "internal: SRC_PATH package '%s' without a clean src_path", p->name);
+        }
+        src_ro = src_path;
+    }
 
     if (set_dep_env(dep_names, dep_paths, ndeps) != 0) {
         env_restore(&snap);

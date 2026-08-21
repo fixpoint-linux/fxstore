@@ -114,11 +114,23 @@ void fx_packageset_free(PackageSet *ps);
 
 /* ─── U2: derivation.c — canonical serializer + sha256 store path ─────── */
 
-/* Content-address a source TREE (Merkle): every direct child of `dir`, sorted
- * by relative path, contributes (u32be len + relpath, type byte 'd'|'f',
- * u32be len + content-sha256-hex); directories hash their own entry stream
- * recursively; the result is sha256_hex over the top-level stream.  Rejects
- * non-regular/non-dir entries loudly (no silent skips). */
+/* The clean-source Merkle hash of a source TREE, with an optional clean COPY
+ * in the same single walk.  The tree is CLEANED before hashing/copying by an
+ * exclusion table (see fx_clean_tree's comment in derivation.c — the
+ * AUTHORITATIVE spec): git state (.git, dir or submodule gitfile), committed
+ * build binaries (.o .a .so .com .dbg .elf, .ape- prefix), and caches/build
+ * dirs (.cache build build-tmp __pycache__ .py-site pydl dl-test-*) are
+ * SILENTLY SKIPPED, so the store path is a pure function of SOURCE content,
+ * independent of checkout state.  Excluded entries are silent skips, not
+ * errors; symlinks are content (type 'l', hashing the readlink target);
+ * special files (sockets/devices/fifos) are rejected loudly.  Both modes
+ * share ONE serializer, so copy-hash == walk-hash by construction.
+ *   fx_clean_tree(dir, NULL, ...)            hash-only walk
+ *   fx_clean_tree(dir, dst, ...)             copy+hash in one pass (dst dir
+ *                                            must already exist)
+ * fx_content_hash_dir is the thin hash-only wrapper. */
+int fx_clean_tree(const char *dir, const char *dst, char hash_out[65],
+                  char *err, size_t errcap);
 int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t errcap);
 
 /* sha256 over the canonical derivation serialization (Decision 4):
@@ -128,10 +140,14 @@ int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t er
  *   dep's FULL store path, SORTED lexicographically).  All strings are
  *   u32be-length-prefixed (never NUL/whitespace-delimited).
  * dep_paths are the direct deps' store paths in ANY order; they are sorted
- * internally so the invariant is enforced here. */
-int fx_derivation_hash(const Package *p, char *const *dep_paths, int ndeps,
-                       char hash_out[65], char *err, size_t errcap);
-
+ * internally so the invariant is enforced here.
+ * fx_derivation_hash_ex takes a PRECOMPUTED clean source hash for SRC_PATH
+ * (the caller's PathEntry.src_hash, reused by fx_store_ensure_source so the
+ * derivation hash and the materialized src are the same content); pass NULL
+ * for SRC_FETCH.  fx_derivation_hash computes the clean hash itself. */
+int fx_derivation_hash_ex(const Package *p, const char *src_hash,
+                          char *const *dep_paths, int ndeps,
+                          char hash_out[65], char *err, size_t errcap);
 /* Store path layout: "<store_root>/<hex64>-<name>". */
 void fx_store_path_of(const char *store_root, const char *hash,
                       const char *name, char *out, size_t cap);
@@ -144,7 +160,8 @@ int fx_derivation_store_path(const Package *p, char *const *dep_paths, int ndeps
 /* ─── U3: closure.c — Datalog closure fixpoint + topo-sort ────────────── */
 
 /* The datalog DB directory inside a store (root/.db).  Metadata relations:
- * pkg(name) dep(from,to) root(name) closure(name) store(hash,name). */
+ * pkg(name) dep(from,to) root(name) closure(name) store(hash,name)
+ * srcstore(hash,name) (the clean-source artifact index). */
 #define FX_DB_SUBDIR ".db"
 /* Build scratch area: a SIBLING directory of the store root, "<root>.build"
  * (never inside the store).  Recipes build into
@@ -210,6 +227,20 @@ const char *fx_store_root(const FxStore *s);/* store root, no trailing '/' */
 /* Publish a snapshot of the metadata DB (must not be called inside a txn). */
 int fx_store_publish(FxStore *s, char *err, size_t errcap);
 
+/* Materialize the CLEAN source tree of a SRC_PATH package into the store as
+ * a content-addressed artifact "<root>/<src_hash>-<name>-src" and commit the
+ * srcstore(src_hash,name) fact (the clean source the recipe later ro-binds as
+ * FX_SRC — so the build reads the SAME clean bytes the store path was hashed
+ * from).  Uses the SAME build-tmp + atomic-rename + metadata-LAST pattern as
+ * fx_store_build, and FAILS LOUDLY if the source changed between compute_paths
+ * (which produced src_hash) and the copy (the streamed copy's hash must equal
+ * src_hash — a TOCTOU guard).  If the artifact already exists it is ADOPTED.
+ * src_path_out receives the artifact path on success.  SRC_FETCH packages are
+ * a no-op and must NOT call this (guard on p->src.kind==SRC_PATH). */
+int fx_store_ensure_source(FxStore *s, const Package *p, const char *src_hash,
+                           char *src_path_out, size_t cap,
+                           char *err, size_t errcap);
+
 /* Build ONE package into the store (deps are already built; their store
  * paths are dep_paths, parallel to dep_names):
  *   1. run the recipe into <root>.build/<hash>-<name>-<pid>  (U5 executor;
@@ -220,9 +251,12 @@ int fx_store_publish(FxStore *s, char *err, size_t errcap);
  *      reapable orphan dir, never dangling metadata.
  * If final_path already exists the build is ADOPTED (content addressing is
  * idempotent) and only the missing metadata fact is committed.
- * hash is the derivation sha256 (hex64), name the package name. */
+ * hash is the derivation sha256 (hex64), name the package name.
+ * src_path is the CLEAN source artifact path for SRC_PATH packages (the
+ * output of fx_store_ensure_source) or NULL for SRC_FETCH; it is what the
+ * recipe's FX_SRC / src_ro bind points at. */
 int fx_store_build(FxStore *s, const Package *p, const char *hash,
-                   const char *final_path,
+                   const char *final_path, const char *src_path,
                    char *const *dep_names, char *const *dep_paths, int ndeps,
                    char *err, size_t errcap);
 
@@ -274,7 +308,11 @@ void fx_cosmo_resolve(void);
  * have to create the nested mountpoint through the read-only bind) and
  * short enough to keep the LANDLOCK_SPEC inside stage3's 256-byte budget.
  * The store and src stay at their HOST paths (deps are reached via
- * FX_DEP_* store paths).  RATTAN_ and LD_
+ * FX_DEP_* store paths).  `src_path` is the CLEAN source artifact path for a
+ * SRC_PATH package (NULL for SRC_FETCH): it is ro-bound + Landlock :rx
+ * unveiled as FX_SRC, and points at the materialized clean tree in the store
+ * (<root>/<src_hash>-<name>-src) — NOT the raw checkout, which is no longer
+ * unveiled (a TIGHTENING).  RATTAN_ and LD_
  * env vars are scrubbed from the child first (stage3 reads
  * RATTAN_ALLOW_PTRACE/RATTAN_EXTRA_PROMISES/RATTAN_RLIMITS; LD_PRELOAD
  * injects into the exec chain).  stage3-absent fails LOUDLY (127); if
@@ -283,7 +321,8 @@ void fx_cosmo_resolve(void);
  * action's exit code, or -1 on an executor error (err set). */
 int fx_build_recipe(const Package *p, const char *workdir,
                     char *const *dep_names, char *const *dep_paths, int ndeps,
-                    const char *store_root, char *err, size_t errcap);
+                    const char *store_root, const char *src_path,
+                    char *err, size_t errcap);
 
 /* Echo one action to stdout (like make / dhake). */
 void fx_print_action(const Action *a);

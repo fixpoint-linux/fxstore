@@ -92,50 +92,112 @@ static int buf_str(Buf *b, const char *s, char *err, size_t errcap) {
     return 0;
 }
 
-/* ─── File content hashing ─────────────────────────────────────────────── */
+/* ─── Clean-source exclusion table ──────────────────────────────────────
+ * 'Clean' = the source inputs a `make -B <target>` recipe recompiles from.
+ * Everything else — git/checkout state, committed build binaries, caches —
+ * must NOT influence the store path (the reproducibility bug this fixes), so
+ * it is EXCLUDED from the clean-tree hash AND from the materialized clean
+ * copy.  This list is the AUTHORITATIVE spec (verified against all 6 repo
+ * trees; see handoff-fxstore-cleansrc-artifact-1):
+ *   DIRS (basename match, any depth): .git .cache build build-tmp
+ *       __pycache__ .py-site pydl  — plus the dl-test-* test-dir prefix
+ *   FILES (suffix): .o .a .so .com .dbg .elf
+ *   FILES (prefix): .ape-
+ * `.git` matches BOTH a top-level .git directory AND a submodule gitfile
+ * (basename `.git`, regardless of file/dir).  Excluded entries are SILENT
+ * SKIPS, not errors — a source tree may legitimately contain them, and the
+ * hash must be independent of their presence/absence.  Everything else
+ * (data files, .dhall, .md, headers) is SOURCE and is hashed/copied. */
+static int fx_clean_excluded(const char *basename, int is_dir) {
+    if (!strcmp(basename, ".git")) return 1;    /* dir OR submodule gitfile */
+    if (is_dir) {
+        static const char *const dirs[] = {
+            ".cache", "build", "build-tmp", "__pycache__", ".py-site", "pydl"
+        };
+        for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++)
+            if (!strcmp(basename, dirs[i])) return 1;
+        if (!strncmp(basename, "dl-test-", 8)) return 1;
+    } else {
+        static const char *const exts[] = {
+            ".o", ".a", ".so", ".com", ".dbg", ".elf"
+        };
+        size_t bl = strlen(basename);
+        for (size_t i = 0; i < sizeof exts / sizeof exts[0]; i++) {
+            size_t el = strlen(exts[i]);
+            if (bl > el && !strcmp(basename + bl - el, exts[i])) return 1;
+        }
+        if (!strncmp(basename, ".ape-", 5)) return 1;
+    }
+    return 0;
+}
 
-static int sha256_file(const char *path, char out[65], char *err, size_t errcap) {
+/* ─── File content hashing (with optional streaming copy) ──────────────── */
+
+/* sha256 of a regular file's bytes; when `dst` is non-NULL the file is
+ * stream-copied to it in the SAME single pass, so the bytes written are
+ * exactly the bytes hashed — the copy-mode hash is byte-identical to the
+ * hash-only walk BY CONSTRUCTION (no second serializer to drift). */
+static int sha256_file_copy(const char *path, const char *dst, char out[65],
+                            char *err, size_t errcap) {
     FILE *f = fopen(path, "rb");
     if (!f) return fx_err(err, errcap, "cannot open source file '%s': %s", path, strerror(errno));
+    FILE *g = NULL;
+    if (dst) {
+        g = fopen(dst, "wb");
+        if (!g) { fclose(f); return fx_err(err, errcap, "cannot create '%s': %s", dst, strerror(errno)); }
+    }
     size_t cap = 1 << 16, len = 0;
     char *buf = malloc(cap);
-    if (!buf) { fclose(f); return fx_err(err, errcap, "out of memory"); }
+    if (!buf) { if (g) fclose(g); fclose(f); return fx_err(err, errcap, "out of memory"); }
+    int rc = -1;
     for (;;) {
         if (len == cap) {
             cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); fclose(f); return fx_err(err, errcap, "out of memory"); }
+            if (!nb) { fx_err(err, errcap, "out of memory"); goto out; }
             buf = nb;
         }
         size_t n = fread(buf + len, 1, cap - len, f);
+        if (g && n > 0 && fwrite(buf + len, 1, n, g) != n) {
+            fx_err(err, errcap, "write error on '%s'", dst);
+            goto out;
+        }
         len += n;
         if (n == 0) break;
     }
-    if (ferror(f)) {
-        free(buf); fclose(f);
-        return fx_err(err, errcap, "read error on '%s'", path);
-    }
-    fclose(f);
+    if (ferror(f)) { fx_err(err, errcap, "read error on '%s'", path); goto out; }
     sha256_hex(buf, len, out);
+    rc = 0;
+out:
+    if (g) fclose(g);
+    fclose(f);
     free(buf);
-    return 0;
+    return rc;
 }
 
-/* ─── content_hash_dir — Merkle hash of a source tree ────────────────────
- * Stream = for each direct child of `dir` (SORTED by name, strcmp):
- *     buf_str(child_name) + byte 'd'|'f' + buf_str(child content hash)
- * where a directory child's content hash is its own recursive stream hash
- * and a regular file child's is sha256 of its bytes.  The returned hash is
- * sha256 over the top-level stream.  Hidden files are CONTENT (only "."
- * and ".." are skipped); symlinks and special files are rejected loudly. */
-
+/* ─── fx_clean_tree — clean Merkle hash of a source tree + optional copy ──
+ * The ONE Merkle serializer, in two modes:
+ *   dst == NULL : hash-only walk (compute_paths' source hashing, verify)
+ *   dst != NULL : copy+hash in a single walk (fx_store_ensure_source) —
+ *                 dirs are mkdir'd, files stream-copied, symlinks recreated,
+ *                 ALL with the SAME serializer as the hash-only mode, so the
+ *                 materialized copy's hash == the hash-only walk's hash.
+ * Stream = for each NON-EXCLUDED direct child of `dir` (SORTED by name,
+ * strcmp): buf_str(child_name) + byte 'd'|'f'|'l' + buf_str(child content
+ * hash); a directory child's hash is its own recursive stream hash, a
+ * regular file child's is sha256 of its bytes, a symlink child's is sha256
+ * of its readlink target (type 'l' — preserved from the original hashing).
+ * The returned hash is sha256 over the top-level stream.  Hidden files are
+ * CONTENT (only "." and ".." are skipped); excluded entries are SILENT
+ * SKIPS; special files (sockets, devices, fifos) are rejected loudly. */
 typedef struct { char *name; char hash[65]; unsigned char type; } DirEnt;
 
 static int dirent_cmp(const void *a, const void *b) {
     return strcmp(((const DirEnt *)a)->name, ((const DirEnt *)b)->name);
 }
 
-int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t errcap) {
+int fx_clean_tree(const char *dir, const char *dst, char hash_out[65],
+                  char *err, size_t errcap) {
     DIR *d = opendir(dir);
     if (!d) return fx_err(err, errcap, "cannot open source dir '%s': %s", dir, strerror(errno));
 
@@ -163,37 +225,63 @@ int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t er
             free(child);
             goto out;
         }
+        /* silent skip of excluded entries (git state, committed binaries,
+         * caches) — see fx_clean_excluded */
+        if (fx_clean_excluded(e->d_name, S_ISDIR(st.st_mode))) {
+            free(child);
+            continue;
+        }
+
+        /* copy-mode destination child path (NULL in hash-only mode) */
+        char *dchild = NULL;
+        if (dst) {
+            size_t dlen = strlen(dst) + 1 + strlen(e->d_name) + 1;
+            dchild = malloc(dlen);
+            if (!dchild) { fx_err(err, errcap, "out of memory"); free(child); goto out; }
+            snprintf(dchild, dlen, "%s/%s", dst, e->d_name);
+        }
+
         if (S_ISDIR(st.st_mode)) {
+            if (dchild && mkdir(dchild, 0755) != 0) {
+                fx_err(err, errcap, "cannot create '%s': %s", dchild, strerror(errno));
+                free(child); free(dchild); goto out;
+            }
             ents[n].type = 'd';
-            if (fx_content_hash_dir(child, ents[n].hash, err, errcap) != 0) { free(child); goto out; }
+            if (fx_clean_tree(child, dchild, ents[n].hash, err, errcap) != 0) {
+                free(child); free(dchild); goto out;
+            }
         } else if (S_ISREG(st.st_mode)) {
             ents[n].type = 'f';
-            if (sha256_file(child, ents[n].hash, err, errcap) != 0) { free(child); goto out; }
+            if (sha256_file_copy(child, dchild, ents[n].hash, err, errcap) != 0) {
+                free(child); free(dchild); goto out;
+            }
         } else if (S_ISLNK(st.st_mode)) {
             /* A symlink is content: its TARGET (readlink bytes) is hashed,
              * type 'l'.  This keeps the store path a function of the actual
              * tree content — a symlink retarget changes the hash — while
              * accepting trees that legitimately contain symlinks (e.g. the
-             * vendored ggml in datalog-dafsa).  The workdir copy (cp -a) and
-             * the sandbox ro-bind both preserve symlinks, so the recipe can
-             * follow them; a broken symlink (readlink succeeds, target
+             * vendored ggml in datalog-dafsa).  In copy mode it is recreated
+             * via symlink(); a broken symlink (readlink succeeds, target
              * missing) is still hashed and copied faithfully. */
             char target[PATH_MAX];
             ssize_t tl = readlink(child, target, sizeof target - 1);
             if (tl < 0) {
                 fx_err(err, errcap, "readlink '%s': %s", child, strerror(errno));
-                free(child);
-                goto out;
+                free(child); free(dchild); goto out;
             }
             target[tl] = '\0';
             sha256_hex((const unsigned char *)target, (size_t)tl, ents[n].hash);
             ents[n].type = 'l';
+            if (dchild && symlink(target, dchild) != 0) {
+                fx_err(err, errcap, "symlink '%s': %s", dchild, strerror(errno));
+                free(child); free(dchild); goto out;
+            }
         } else {
             fx_err(err, errcap, "unsupported special source entry '%s'", child);
-            free(child);
-            goto out;
+            free(child); free(dchild); goto out;
         }
         free(child);
+        free(dchild);
         ents[n].name = strdup(e->d_name);
         if (!ents[n].name) { fx_err(err, errcap, "out of memory"); goto out; }
         n++;
@@ -219,6 +307,11 @@ out:
     for (size_t i = 0; i < n; i++) free(ents[i].name);
     free(ents);
     return rc;
+}
+
+int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t errcap) {
+    /* thin wrapper: hash-only clean walk (no copy) */
+    return fx_clean_tree(dir, NULL, hash_out, err, errcap);
 }
 
 /* ─── Canonical action tags (fixed one-byte kind markers) ──────────────── */
@@ -267,13 +360,21 @@ static int pcmp(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
-int fx_derivation_hash(const Package *p, char *const *dep_paths, int ndeps,
-                       char hash_out[65], char *err, size_t errcap) {
+/* Canonical derivation serialization with a PRECOMPUTED clean source hash:
+ * for SRC_PATH, `src_hash` is the clean-tree hash (fx_content_hash_dir /
+ * fx_clean_tree) computed by the caller ONCE and stored in PathEntry.src_hash
+ * so compute_paths and fx_store_ensure_source share it (no double hash walk,
+ * and the derivation hash and the materialized src are provably the same
+ * content).  For SRC_FETCH, src_hash must be NULL and url+hash are used. */
+int fx_derivation_hash_ex(const Package *p, const char *src_hash,
+                          char *const *dep_paths, int ndeps,
+                          char hash_out[65], char *err, size_t errcap) {
     if (!p || !hash_out) return fx_err(err, errcap, "internal: null package/hash");
     if (ndeps < 0) return fx_err(err, errcap, "internal: negative dep count");
+    if (p->src.kind == SRC_PATH && !src_hash)
+        return fx_err(err, errcap, "internal: SRC_PATH without a precomputed src hash");
 
     Buf b = {0};
-    char src_hash[65];
 
     /* (1) magic — versioned so a format change can never silently alias */
     if (buf_str(&b, "fxstore-drv-v1\n", err, errcap) != 0) goto fail;
@@ -282,10 +383,9 @@ int fx_derivation_hash(const Package *p, char *const *dep_paths, int ndeps,
     if (buf_str(&b, p->name, err, errcap) != 0) goto fail;
     if (buf_str(&b, p->version, err, errcap) != 0) goto fail;
 
-    /* (4) src: 'P' + content-hash of the tree | 'F' + url + hash */
+    /* (4) src: 'P' + clean content-hash of the tree | 'F' + url + hash */
     if (p->src.kind == SRC_PATH) {
         if (buf_byte(&b, 'P') != 0) { fx_err(err, errcap, "out of memory"); goto fail; }
-        if (fx_content_hash_dir(p->src.path, src_hash, err, errcap) != 0) goto fail;
         if (buf_str(&b, src_hash, err, errcap) != 0) goto fail;
     } else {
         if (buf_byte(&b, 'F') != 0) { fx_err(err, errcap, "out of memory"); goto fail; }
@@ -327,6 +427,22 @@ int fx_derivation_hash(const Package *p, char *const *dep_paths, int ndeps,
 fail:
     free(b.d);
     return -1;
+}
+
+/* Convenience wrapper: compute the clean source hash (hash-only walk) then
+ * delegate to fx_derivation_hash_ex.  Callers that already computed the hash
+ * (compute_paths, which must reuse it for fx_store_ensure_source) call the
+ * _ex form directly. */
+int fx_derivation_hash(const Package *p, char *const *dep_paths, int ndeps,
+                       char hash_out[65], char *err, size_t errcap) {
+    char src_hash[65];
+    if (p->src.kind == SRC_PATH) {
+        if (fx_content_hash_dir(p->src.path, src_hash, err, errcap) != 0) return -1;
+        return fx_derivation_hash_ex(p, src_hash, dep_paths, ndeps,
+                                     hash_out, err, errcap);
+    }
+    return fx_derivation_hash_ex(p, NULL, dep_paths, ndeps,
+                                 hash_out, err, errcap);
 }
 
 void fx_store_path_of(const char *store_root, const char *hash,

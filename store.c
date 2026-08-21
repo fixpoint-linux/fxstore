@@ -180,6 +180,13 @@ FxStore *fx_store_open(const char *root, char *err, size_t errcap) {
         free(s);
         return NULL;
     }
+    /* the clean-source artifact index (idempotent declare) */
+    if (dl_declare_relation(s->db, "srcstore", 2) != 0) {
+        fx_err(err, errcap, "cannot declare relation 'srcstore'");
+        dl_close(s->db);
+        free(s);
+        return NULL;
+    }
     return s;
 }
 
@@ -221,10 +228,31 @@ static int commit_store_fact(FxStore *s, const char *hash, const char *name,
     return 0;
 }
 
+/* Commit srcstore(hash,name) — the clean-source artifact index — as one
+ * atomic txn, mirroring commit_store_fact exactly (idempotent no-op when the
+ * fact is already present). */
+static int commit_srcstore_fact(FxStore *s, const char *hash, const char *name,
+                                char *err, size_t errcap) {
+    uint32_t cols[2] = { dl_intern_str(s->db, hash), dl_intern_str(s->db, name) };
+    if (!cols[0] || !cols[1])
+        return fx_err(err, errcap, "out of memory interning srcstore fact");
+    if (dl_lookup(s->db, "srcstore", cols, 2))
+        return 0;                              /* already committed */
+
+    if (dl_txn_begin(s->db) != 0)
+        return fx_err(err, errcap, "txn begin failed (another txn open?)");
+    if (dl_txn_add_fact(s->db, "srcstore", cols, 2) != 0 || dl_txn_commit(s->db) != 0) {
+        dl_txn_rollback(s->db);
+        return fx_err(err, errcap, "metadata commit failed for srcstore '%s-%s' "
+                                   "(dir is an orphan; gc will reap it)", hash, name);
+    }
+    return 0;
+}
+
 /* ─── fx_store_build ───────────────────────────────────────────────────── */
 
 int fx_store_build(FxStore *s, const Package *p, const char *hash,
-                   const char *final_path,
+                   const char *final_path, const char *src_path,
                    char *const *dep_names, char *const *dep_paths, int ndeps,
                    char *err, size_t errcap) {
     if (!s || !p || !hash || !final_path)
@@ -247,7 +275,8 @@ int fx_store_build(FxStore *s, const Package *p, const char *hash,
     if (mkdir(tmp, 0755) != 0)
         return fx_err(err, errcap, "cannot create temp dir '%s': %s", tmp, strerror(errno));
 
-    int rc = fx_build_recipe(p, tmp, dep_names, dep_paths, ndeps, s->root, err, errcap);
+    int rc = fx_build_recipe(p, tmp, dep_names, dep_paths, ndeps, s->root,
+                             src_path, err, errcap);
     if (rc != 0) {
         if (err && err[0] == '\0')
             snprintf(err, errcap, "recipe action failed with exit code %d", rc);
@@ -273,6 +302,74 @@ int fx_store_build(FxStore *s, const Package *p, const char *hash,
     /* METADATA LAST: the single atomic commit point.  A crash before this
        leaves the installed dir as a reapable orphan — never the reverse. */
     if (commit_store_fact(s, hash, p->name, err, errcap) != 0)
+        return -1;
+    return 0;
+}
+
+/* ─── fx_store_ensure_source ───────────────────────────────────────────── */
+
+int fx_store_ensure_source(FxStore *s, const Package *p, const char *src_hash,
+                           char *src_path_out, size_t cap,
+                           char *err, size_t errcap) {
+    if (!s || !p || !src_hash || !src_path_out)
+        return fx_err(err, errcap, "internal: null args to fx_store_ensure_source");
+    if (p->src.kind != SRC_PATH)
+        return fx_err(err, errcap, "internal: ensure_source on a non-Path source");
+
+    /* content-addressed clean-source artifact, in the STORE (already covered
+       by the existing --ro-bind store_root + Landlock store_root:r) */
+    if (snprintf(src_path_out, cap, "%s/%s-%s-src", s->root, src_hash, p->name)
+            >= (int)cap)
+        return fx_err(err, errcap, "clean source path too long");
+
+    /* idempotent adoption: the artifact already exists — ensure metadata */
+    if (is_dir(src_path_out))
+        return commit_srcstore_fact(s, src_hash, p->name, err, errcap);
+
+    /* materialize into the SAME build scratch area as fx_store_build (a
+       sibling of the store on the same filesystem, so the rename is atomic) */
+    char tmp[FX_PATH_MAX];
+    if (snprintf(tmp, sizeof tmp, "%s/%s-%s-src-%ld", s->build, src_hash,
+                 p->name, (long)getpid()) >= (int)sizeof tmp)
+        return fx_err(err, errcap, "temp clean-source path too long");
+
+    if (is_dir(tmp)) rm_rf(tmp);               /* stale same-pid leftover */
+    if (mkdir(tmp, 0755) != 0)
+        return fx_err(err, errcap, "cannot create temp src dir '%s': %s", tmp, strerror(errno));
+
+    /* copy + hash in ONE walk; the streamed hash MUST equal the precomputed
+       src_hash, else the source changed between compute_paths and build
+       (TOCTOU) — fail loudly rather than build from different bytes */
+    char actual[65];
+    if (fx_clean_tree(p->src.path, tmp, actual, err, errcap) != 0) {
+        rm_rf(tmp);
+        return -1;
+    }
+    if (strcmp(actual, src_hash) != 0) {
+        rm_rf(tmp);
+        return fx_err(err, errcap,
+                      "source '%s' changed between path computation and build "
+                      "(expected clean hash %.16s..., got %.16s...); "
+                      "re-run fxstore build", p->src.path, src_hash, actual);
+    }
+
+    /* ATOMIC INSTALL: rename temp -> artifact.  EEXIST/ENOTEMPTY means a
+       concurrent build materialized the same content — adopt theirs. */
+    if (rename(tmp, src_path_out) != 0) {
+        if ((errno == EEXIST || errno == ENOTEMPTY) && is_dir(src_path_out)) {
+            rm_rf(tmp);
+            return commit_srcstore_fact(s, src_hash, p->name, err, errcap);
+        }
+        fx_err(err, errcap, "cannot install clean source '%s': %s", src_path_out, strerror(errno));
+        rm_rf(tmp);
+        return -1;
+    }
+
+    /* durability of the rename before the metadata commit (best-effort) */
+    fsync_dir_best_effort(s->root);
+
+    /* METADATA LAST: the single atomic commit point, mirroring fx_store_build */
+    if (commit_srcstore_fact(s, src_hash, p->name, err, errcap) != 0)
         return -1;
     return 0;
 }
@@ -415,25 +512,32 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
     uint32_t pinned = vers[total - 1];
     free(vers);
 
-    /* 2. read pkg / dep / store from the PINNED version */
+    /* 2. read pkg / dep / store / srcstore from the PINNED version */
     PairBag deps  = { s->db, NULL, NULL, 0, 0, 0 };
     PairBag stores = { s->db, NULL, NULL, 0, 0, 0 };
+    PairBag srcstores = { s->db, NULL, NULL, 0, 0, 0 };
     PairBag pkgs  = { s->db, NULL, NULL, 0, 0, 0 };
     {
         long rd = dl_query_version(s->db, pinned, "dep", pair_cb, &deps);
         long rs = dl_query_version(s->db, pinned, "store", pair_cb, &stores);
+        long rss = dl_query_version(s->db, pinned, "srcstore", pair_cb, &srcstores);
         long rp = dl_query_version(s->db, pinned, "pkg", pair_cb, &pkgs);
-        if (rd < 0 || rs < 0 || rp < 0 || deps.oom || stores.oom || pkgs.oom) {
+        if (rd < 0 || rs < 0 || rss < 0 || rp < 0 ||
+            deps.oom || stores.oom || srcstores.oom || pkgs.oom) {
             fx_err(err, errcap,
-                   "pinned snapshot read failed (version %u): dep=%ld store=%ld pkg=%ld oom=%d%d%d",
-                   pinned, rd, rs, rp, deps.oom, stores.oom, pkgs.oom);
-            pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&pkgs);
+                   "pinned snapshot read failed (version %u): dep=%ld store=%ld "
+                   "srcstore=%ld pkg=%ld oom=%d%d%d%d",
+                   pinned, rd, rs, rss, rp, deps.oom, stores.oom,
+                   srcstores.oom, pkgs.oom);
+            pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&srcstores);
+            pairbag_free(&pkgs);
             return -1;
         }
     }
 
     if (!in_set(pkgs.a, pkgs.n, root_pkg)) {
-        pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&pkgs);
+        pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&srcstores);
+        pairbag_free(&pkgs);
         return fx_err(err, errcap, "gc root '%s' is not a package in the pinned snapshot", root_pkg);
     }
 
@@ -441,14 +545,15 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
     char **live = NULL;
     int nlive = 0;
     if (reachable_names(&deps, root_pkg, &live, &nlive) != 0) {
-        pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&pkgs);
+        pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&srcstores);
+        pairbag_free(&pkgs);
         return fx_err(err, errcap, "out of memory computing reachability");
     }
 
-    /* 4. METADATA FIRST: atomically txn-delete the unreachable store facts
-       (a crash after this leaves reapable orphan dirs — never dangling
-       metadata pointing at missing dirs, which the dir-first order would
-       create) */
+    /* 4. METADATA FIRST: atomically txn-delete the unreachable store AND
+       srcstore facts (a crash after this leaves reapable orphan dirs — never
+       dangling metadata pointing at missing dirs, which the dir-first order
+       would create) */
     int removed_facts = 0;
     for (int i = 0; i < stores.n; i++) {
         if (in_set(live, nlive, stores.b[i])) continue;   /* name reachable */
@@ -463,9 +568,26 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
         }
         removed_facts++;
     }
+    /* srcstore facts are unreachable exactly when their NAME is unreachable:
+       liveness is name-level, so a clean-source artifact for an unreachable
+       package is unreachable too */
+    for (int i = 0; i < srcstores.n; i++) {
+        if (in_set(live, nlive, srcstores.b[i])) continue;   /* name reachable */
+        uint32_t cols[2] = { dl_intern_str(s->db, srcstores.a[i]),
+                             dl_intern_str(s->db, srcstores.b[i]) };
+        if (!cols[0] || !cols[1]) { fx_err(err, errcap, "out of memory interning gc fact"); goto fail; }
+        if (dl_txn_begin(s->db) != 0) { fx_err(err, errcap, "txn begin failed"); goto fail; }
+        if (dl_txn_delete_fact(s->db, "srcstore", cols, 2) != 0 || dl_txn_commit(s->db) != 0) {
+            dl_txn_rollback(s->db);
+            fx_err(err, errcap, "gc metadata txn failed for srcstore '%s-%s'", srcstores.a[i], srcstores.b[i]);
+            goto fail;
+        }
+        removed_facts++;
+    }
 
-    /* 5. then sweep the unreachable DIRS (well-formed <64hex>-<name> only;
-       malformed entries are reported loudly, never deleted) */
+    /* 5. then sweep the unreachable DIRS (well-formed <64hex>-<name> and
+       <64hex>-<name>-src only; malformed entries are reported loudly, never
+       deleted) */
     int removed_dirs = 0;
     DIR *d = opendir(s->root);
     if (!d) { fx_err(err, errcap, "cannot read store root: %s", strerror(errno)); goto fail; }
@@ -477,7 +599,14 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
             fprintf(stderr, "fxstore: gc: skipping malformed store entry '%s'\n", e->d_name);
             continue;
         }
-        const char *name = e->d_name + 65;
+        /* the base package name: for a clean-source dir "<64hex>-<NAME>-src"
+           strip the trailing "-src"; a built dir "<64hex>-<NAME>" uses NAME */
+        char name[FX_PATH_MAX];
+        size_t nl = len - 65;                /* NAME + optional -src */
+        if (nl > 4 && !strcmp(e->d_name + len - 4, "-src")) nl -= 4;
+        if (nl >= sizeof name) continue;
+        memcpy(name, e->d_name + 65, nl);
+        name[nl] = '\0';
         if (in_set(live, nlive, name)) continue;
         char path[FX_PATH_MAX];
         if (snprintf(path, sizeof path, "%s/%s", s->root, e->d_name) >= (int)sizeof path)
@@ -503,11 +632,13 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
 
     for (int i = 0; i < nlive; i++) free(live[i]);
     free(live);
-    pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&pkgs);
+    pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&srcstores);
+    pairbag_free(&pkgs);
     return 0;
 fail:
     for (int i = 0; i < nlive; i++) free(live[i]);
     free(live);
-    pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&pkgs);
+    pairbag_free(&deps); pairbag_free(&stores); pairbag_free(&srcstores);
+    pairbag_free(&pkgs);
     return -1;
 }

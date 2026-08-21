@@ -91,9 +91,15 @@ fxstore-sandboxed: fxstore
 fxstore-m3: fxstore
 	@tests/fxstore_m3.sh ./fxstore
 
-test: fxstore-golden fxstore-sandboxed fxstore-m3
+# M3 reproducibility test: two identical-content source trees with differing
+# .git state must produce the SAME store path, and the clean-source artifact
+# must not contain .git or committed artifacts.  bwrap-free (pure-FS recipes).
+fxstore-repro: fxstore
+	@tests/fxstore_repro.sh ./fxstore
+
+test: fxstore-golden fxstore-sandboxed fxstore-m3 fxstore-repro
 
 clean:
 	rm -f fxstore fxstore.aarch64.elf fxstore.com.dbg
 
-.PHONY: all clean test fxstore-golden fxstore-sandboxed fxstore-m3 stage3
+.PHONY: all clean test fxstore-golden fxstore-sandboxed fxstore-m3 fxstore-repro stage3
