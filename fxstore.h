@@ -88,6 +88,12 @@ typedef struct Package {
     Src src;
     char **deps;           /* direct dep NAMES, package-set order */
     int ndeps;
+    char **excludes;       /* optional RELATIVE-PATH-PREFIX exclusions within
+                              the src tree; applied on top of the global
+                              fx_clean_excluded table, in BOTH hash and copy
+                              modes.  NULL/0 when absent.  Entries are
+                              validated at load (clean relative paths only). */
+    int nexcludes;
     char *target;          /* build.target (output name; informational) */
     Action *recipe;        /* linked list, package-set ORDER (semantic) */
     struct Package *next;  /* package-set order */
@@ -125,13 +131,21 @@ void fx_packageset_free(PackageSet *ps);
  * errors; symlinks are content (type 'l', hashing the readlink target);
  * special files (sockets/devices/fifos) are rejected loudly.  Both modes
  * share ONE serializer, so copy-hash == walk-hash by construction.
- *   fx_clean_tree(dir, NULL, ...)            hash-only walk
- *   fx_clean_tree(dir, dst, ...)             copy+hash in one pass (dst dir
- *                                            must already exist)
+ * PER-PACKAGE EXCLUDES: `excludes`/`nexcludes` are additional RELATIVE-PATH-
+ * PREFIX patterns (each is a path within the src tree, e.g. "models" or
+ * "vendor/ggml"), applied on top of the global table, in BOTH hash and copy
+ * modes so hash==copy.  A child with relative path `rel` is excluded if
+ * rel==entry or rel starts with entry+"/".  Empty list (NULL/0) = the global
+ * table alone.
+ *   fx_clean_tree(dir, dst, NULL, 0, ...)     hash-only walk
+ *   fx_clean_tree(dir, dst, ex, nx, ...)      copy+hash in one pass (dst dir
+ *                                             must already exist)
  * fx_content_hash_dir is the thin hash-only wrapper. */
-int fx_clean_tree(const char *dir, const char *dst, char hash_out[65],
-                  char *err, size_t errcap);
-int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t errcap);
+int fx_clean_tree(const char *dir, const char *dst,
+                  char *const *excludes, int nexcludes,
+                  char hash_out[65], char *err, size_t errcap);
+int fx_content_hash_dir(const char *dir, char *const *excludes, int nexcludes,
+                        char hash_out[65], char *err, size_t errcap);
 
 /* sha256 over the canonical derivation serialization (Decision 4):
  *   magic "fxstore-drv-v1\n" | name | version | src ('P' + content-hash |

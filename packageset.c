@@ -291,6 +291,38 @@ static Package *map_package(Term *rec, const char *base_dir, char *err, size_t e
         p->deps[i++] = d;
     }
 
+    /* optional `excludes : List Text` — absent field => empty list (backward
+       compat: a package-set without `excludes` still loads unchanged) */
+    Term *excl = rec_get(rec, "excludes");
+    if (excl) {
+        if (excl->tag != TmNil && excl->tag != TmCons)
+            { fx_err(err, errcap, "%s: 'excludes' must be a List Text", where); goto fail; }
+        p->nexcludes = list_length(excl);
+        if (p->nexcludes > 0) {
+            p->excludes = calloc((size_t)p->nexcludes, sizeof(char *));
+            if (!p->excludes) { fx_err(err, errcap, "out of memory"); goto fail; }
+            int j = 0;
+            for (Term *q = excl; q && q->tag == TmCons; q = q->as.cons.tail) {
+                char *x = term_text_cstr(q->as.cons.head);
+                if (!x) { fx_err(err, errcap, "%s: excludes entry must be Text", where); goto fail; }
+                /* LOUD rejection of entries that can never match: relative
+                   paths within the src tree never start with '/' or "./",
+                   never end with '/', never contain "//", and "" / "." / ".."
+                   are meaningless.  Silent acceptance would silently keep
+                   hashing the content the author meant to exclude. */
+                size_t xl = strlen(x);
+                if (xl == 0 || x[0] == '/' || (xl >= 2 && x[0] == '.' && x[1] == '/') ||
+                    x[xl - 1] == '/' || strstr(x, "//") ||
+                    !strcmp(x, ".") || !strcmp(x, "..")) {
+                    fx_err(err, errcap, "%s: excludes entry '%s' is not a clean relative path within the src tree", where, x);
+                    free(x);
+                    goto fail;
+                }
+                p->excludes[j++] = x;
+            }
+        }
+    }
+
     Term *build = rec_get(rec, "build");
     if (!build || build->tag != TmRecordLit)
         { fx_err(err, errcap, "%s: missing or non-record 'build' (need { target, recipe })", where); goto fail; }
@@ -456,6 +488,8 @@ void fx_packageset_free(PackageSet *ps) {
         free(p->src.hash);
         for (int i = 0; i < p->ndeps; i++) free(p->deps[i]);
         free(p->deps);
+        for (int i = 0; i < p->nexcludes; i++) free(p->excludes[i]);
+        free(p->excludes);
         free(p->target);
         Action *a = p->recipe;
         while (a) {

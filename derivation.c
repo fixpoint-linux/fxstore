@@ -131,14 +131,37 @@ static int fx_clean_excluded(const char *basename, int is_dir) {
     return 0;
 }
 
+/* Per-package exclusion: `entry` is a RELATIVE-PATH-PREFIX within the src
+ * tree.  A child with relative path `rel` is excluded when rel==entry OR rel
+ * starts with entry+"/" (i.e. entry is an ancestor directory path-prefix).
+ * Empty list (NULL/0) excludes nothing.  Applied on top of fx_clean_excluded,
+ * identically in hash and copy modes so the store path is the same whether
+ * the caller hashes (compute_paths) or materializes (fx_store_ensure_source). */
+static int fx_excluded_by_rel(const char *rel,
+                              char *const *excludes, int nexcludes) {
+    for (int i = 0; i < nexcludes; i++) {
+        const char *entry = excludes[i];
+        size_t len = strlen(entry);
+        if (len == 0) continue;               /* defense-in-depth: empty entries
+                                               * are rejected at parse time */
+        if (strncmp(rel, entry, len) == 0 &&
+            (rel[len] == '\0' || rel[len] == '/'))
+            return 1;
+    }
+    return 0;
+}
+
 /* ─── File content hashing (with optional streaming copy) ──────────────── */
 
 /* sha256 of a regular file's bytes; when `dst` is non-NULL the file is
  * stream-copied to it in the SAME single pass, so the bytes written are
  * exactly the bytes hashed — the copy-mode hash is byte-identical to the
- * hash-only walk BY CONSTRUCTION (no second serializer to drift). */
-static int sha256_file_copy(const char *path, const char *dst, char out[65],
-                            char *err, size_t errcap) {
+ * hash-only walk BY CONSTRUCTION (no second serializer to drift).  The mode
+ * is NOT part of the hash (only bytes + type byte), but in copy mode the
+ * written file is fchmod'd to the SOURCE mode (preserving e.g. the exec bit
+ * for checked-in scripts) so the clean copy faithfully mirrors the source. */
+static int sha256_file_copy(const char *path, const char *dst, mode_t src_mode,
+                            char out[65], char *err, size_t errcap) {
     FILE *f = fopen(path, "rb");
     if (!f) return fx_err(err, errcap, "cannot open source file '%s': %s", path, strerror(errno));
     FILE *g = NULL;
@@ -166,6 +189,15 @@ static int sha256_file_copy(const char *path, const char *dst, char out[65],
         if (n == 0) break;
     }
     if (ferror(f)) { fx_err(err, errcap, "read error on '%s'", path); goto out; }
+    if (g && fchmod(fileno(g), src_mode & 01777) != 0) {
+        /* 01777 (not 07777): mask setuid/setgid off FILES — a build store must
+         * never materialize a setuid binary owned by the building user from
+         * source-tree content (inert in a single-user store, a real hazard on
+         * a shared/root store).  Sticky bit (01000) kept; dir setgid/sticky
+         * are handled separately in fx_clean_tree_rel and are harmless. */
+        fx_err(err, errcap, "cannot chmod '%s': %s", dst, strerror(errno));
+        goto out;
+    }
     sha256_hex(buf, len, out);
     rc = 0;
 out:
@@ -189,15 +221,28 @@ out:
  * of its readlink target (type 'l' — preserved from the original hashing).
  * The returned hash is sha256 over the top-level stream.  Hidden files are
  * CONTENT (only "." and ".." are skipped); excluded entries are SILENT
- * SKIPS; special files (sockets, devices, fifos) are rejected loudly. */
+ * SKIPS; special files (sockets, devices, fifos) are rejected loudly.
+ * PER-PACKAGE EXCLUDES: `excludes`/`nexcludes` (may be NULL/0) add RELATIVE-
+ * PATH-PREFIX patterns on top of the global table — a child with rel path
+ * `rel` is excluded if fx_clean_excluded(basename) OR rel==entry OR rel
+ * starts with entry+"/".  Empty list = global table alone.  Applies in BOTH
+ * modes (hash and copy), so copy-hash == walk-hash stays true even with
+ * excludes.  In copy mode created dirs/files are chmod'd to the SOURCE mode
+ * (mode bits are NOT hashed, so store paths are unaffected). */
 typedef struct { char *name; char hash[65]; unsigned char type; } DirEnt;
 
 static int dirent_cmp(const void *a, const void *b) {
     return strcmp(((const DirEnt *)a)->name, ((const DirEnt *)b)->name);
 }
 
-int fx_clean_tree(const char *dir, const char *dst, char hash_out[65],
-                  char *err, size_t errcap) {
+/* Recursive core of fx_clean_tree.  `rel` is the child's RELATIVE path within
+ * the src tree ("" at the root) — used for per-package path-prefix excludes,
+ * which are applied identically in hash and copy modes.  In copy mode the
+ * created dirs/files are chmod'd to the source mode (mode is NOT hashed). */
+static int fx_clean_tree_rel(const char *dir, const char *dst,
+                             char *const *excludes, int nexcludes,
+                             const char *rel, char hash_out[65],
+                             char *err, size_t errcap) {
     DIR *d = opendir(dir);
     if (!d) return fx_err(err, errcap, "cannot open source dir '%s': %s", dir, strerror(errno));
 
@@ -225,10 +270,22 @@ int fx_clean_tree(const char *dir, const char *dst, char hash_out[65],
             free(child);
             goto out;
         }
-        /* silent skip of excluded entries (git state, committed binaries,
-         * caches) — see fx_clean_excluded */
-        if (fx_clean_excluded(e->d_name, S_ISDIR(st.st_mode))) {
+
+        /* relative path of this child within the src tree (for excludes) */
+        size_t rlen = (rel[0] ? strlen(rel) + 1 : 0) + strlen(e->d_name) + 1;
+        char *child_rel = malloc(rlen);
+        if (!child_rel) { fx_err(err, errcap, "out of memory"); free(child); goto out; }
+        if (rel[0])
+            snprintf(child_rel, rlen, "%s/%s", rel, e->d_name);
+        else
+            snprintf(child_rel, rlen, "%s", e->d_name);
+
+        /* silent skip of excluded entries — global table (git state,
+         * committed binaries, caches) AND per-package path-prefix excludes */
+        if (fx_clean_excluded(e->d_name, S_ISDIR(st.st_mode)) ||
+            fx_excluded_by_rel(child_rel, excludes, nexcludes)) {
             free(child);
+            free(child_rel);
             continue;
         }
 
@@ -237,23 +294,36 @@ int fx_clean_tree(const char *dir, const char *dst, char hash_out[65],
         if (dst) {
             size_t dlen = strlen(dst) + 1 + strlen(e->d_name) + 1;
             dchild = malloc(dlen);
-            if (!dchild) { fx_err(err, errcap, "out of memory"); free(child); goto out; }
+            if (!dchild) { fx_err(err, errcap, "out of memory"); free(child); free(child_rel); goto out; }
             snprintf(dchild, dlen, "%s/%s", dst, e->d_name);
         }
 
         if (S_ISDIR(st.st_mode)) {
-            if (dchild && mkdir(dchild, 0755) != 0) {
-                fx_err(err, errcap, "cannot create '%s': %s", dchild, strerror(errno));
-                free(child); free(dchild); goto out;
+            if (dchild) {
+                if (mkdir(dchild, 0755) != 0) {
+                    fx_err(err, errcap, "cannot create '%s': %s", dchild, strerror(errno));
+                    free(child); free(child_rel); free(dchild); goto out;
+                }
             }
             ents[n].type = 'd';
-            if (fx_clean_tree(child, dchild, ents[n].hash, err, errcap) != 0) {
-                free(child); free(dchild); goto out;
+            if (fx_clean_tree_rel(child, dchild, excludes, nexcludes,
+                                  child_rel, ents[n].hash, err, errcap) != 0) {
+                free(child); free(child_rel); free(dchild); goto out;
+            }
+            /* preserve the source dir mode AFTER filling the copy: applying it
+             * before the recursion would strip the owner-write bit from a
+             * read-only source dir (e.g. `chmod -R a-w vendor`) and make every
+             * child creation inside it fail with EACCES.  (Mode is NOT hashed,
+             * so ordering cannot affect the store path.) */
+            if (dchild && chmod(dchild, st.st_mode & 07777) != 0) {
+                fx_err(err, errcap, "cannot chmod '%s': %s", dchild, strerror(errno));
+                free(child); free(child_rel); free(dchild); goto out;
             }
         } else if (S_ISREG(st.st_mode)) {
             ents[n].type = 'f';
-            if (sha256_file_copy(child, dchild, ents[n].hash, err, errcap) != 0) {
-                free(child); free(dchild); goto out;
+            if (sha256_file_copy(child, dchild, st.st_mode,
+                                 ents[n].hash, err, errcap) != 0) {
+                free(child); free(child_rel); free(dchild); goto out;
             }
         } else if (S_ISLNK(st.st_mode)) {
             /* A symlink is content: its TARGET (readlink bytes) is hashed,
@@ -267,20 +337,21 @@ int fx_clean_tree(const char *dir, const char *dst, char hash_out[65],
             ssize_t tl = readlink(child, target, sizeof target - 1);
             if (tl < 0) {
                 fx_err(err, errcap, "readlink '%s': %s", child, strerror(errno));
-                free(child); free(dchild); goto out;
+                free(child); free(child_rel); free(dchild); goto out;
             }
             target[tl] = '\0';
             sha256_hex((const unsigned char *)target, (size_t)tl, ents[n].hash);
             ents[n].type = 'l';
             if (dchild && symlink(target, dchild) != 0) {
                 fx_err(err, errcap, "symlink '%s': %s", dchild, strerror(errno));
-                free(child); free(dchild); goto out;
+                free(child); free(child_rel); free(dchild); goto out;
             }
         } else {
             fx_err(err, errcap, "unsupported special source entry '%s'", child);
-            free(child); free(dchild); goto out;
+            free(child); free(child_rel); free(dchild); goto out;
         }
         free(child);
+        free(child_rel);
         free(dchild);
         ents[n].name = strdup(e->d_name);
         if (!ents[n].name) { fx_err(err, errcap, "out of memory"); goto out; }
@@ -309,9 +380,17 @@ out:
     return rc;
 }
 
-int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t errcap) {
+int fx_clean_tree(const char *dir, const char *dst,
+                  char *const *excludes, int nexcludes,
+                  char hash_out[65], char *err, size_t errcap) {
+    /* public entry: root has the empty relative path */
+    return fx_clean_tree_rel(dir, dst, excludes, nexcludes, "", hash_out, err, errcap);
+}
+
+int fx_content_hash_dir(const char *dir, char *const *excludes, int nexcludes,
+                        char hash_out[65], char *err, size_t errcap) {
     /* thin wrapper: hash-only clean walk (no copy) */
-    return fx_clean_tree(dir, NULL, hash_out, err, errcap);
+    return fx_clean_tree(dir, NULL, excludes, nexcludes, hash_out, err, errcap);
 }
 
 /* ─── Canonical action tags (fixed one-byte kind markers) ──────────────── */
@@ -437,7 +516,8 @@ int fx_derivation_hash(const Package *p, char *const *dep_paths, int ndeps,
                        char hash_out[65], char *err, size_t errcap) {
     char src_hash[65];
     if (p->src.kind == SRC_PATH) {
-        if (fx_content_hash_dir(p->src.path, src_hash, err, errcap) != 0) return -1;
+        if (fx_content_hash_dir(p->src.path, p->excludes, p->nexcludes,
+                                src_hash, err, errcap) != 0) return -1;
         return fx_derivation_hash_ex(p, src_hash, dep_paths, ndeps,
                                      hash_out, err, errcap);
     }

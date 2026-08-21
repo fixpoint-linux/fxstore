@@ -69,6 +69,11 @@ static void rm_rf(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return;      /* gone */
     if (S_ISDIR(st.st_mode)) {
+        /* clean-copy artifacts mirror SOURCE modes, so they may contain
+         * non-writable dirs (e.g. a `chmod -R a-w` vendored tree); make this
+         * dir owner-writable (best-effort, we own everything here) so the
+         * remove() of its children below can succeed. */
+        chmod(path, 0700);
         DIR *d = opendir(path);
         if (d) {
             struct dirent *e;
@@ -341,7 +346,8 @@ int fx_store_ensure_source(FxStore *s, const Package *p, const char *src_hash,
        src_hash, else the source changed between compute_paths and build
        (TOCTOU) — fail loudly rather than build from different bytes */
     char actual[65];
-    if (fx_clean_tree(p->src.path, tmp, actual, err, errcap) != 0) {
+    if (fx_clean_tree(p->src.path, tmp, p->excludes, p->nexcludes,
+                      actual, err, errcap) != 0) {
         rm_rf(tmp);
         return -1;
     }

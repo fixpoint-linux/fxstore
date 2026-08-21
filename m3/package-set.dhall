@@ -34,33 +34,41 @@ let Action =
 
 let Src = < Path : Text | Fetch : { url : Text, hash : Text } >
 let Build = { target : Text, recipe : List Action }
-let Package = { name : Text, version : Text, src : Src, deps : List Text, build : Build }
+let Package = { name : Text, version : Text, src : Src, deps : List Text,
+                excludes : List Text, build : Build }
 let PackageSet = { packages : List Package }
 
 in  { packages =
       [ { name = "dafsa", version = "0.1.0", src = < Path = "../../github/dafsa" >,
-          deps = [] : List Text,
+          deps = [] : List Text, excludes = [] : List Text,
           build = { target = "dafsa",
                     recipe = [ < Shell = "cp -a \"$FX_SRC\"/. . && make -B dafsa" > ] } }
       , { name = "dhall-c", version = "0.1.0", src = < Path = "../../dhall-c" >,
-          deps = [] : List Text,
+          deps = [] : List Text, excludes = [] : List Text,
           build = { target = "dhall.com",
                     recipe = [ < Shell = "cp -a \"$FX_SRC\"/. . && make -B dhall.com" > ] } }
       , { name = "datalog-dafsa", version = "0.1.0", src = < Path = "../../datalog-dafsa" >,
           deps = [ "dafsa" ],
+          -- `models/` (67MB bge-small gguf) and `vendor/ggml` (28MB submodule)
+          -- are dl-embed/embed-test runtime deps (opt-in targets), NOT inputs to
+          -- `make -B dl` (which builds only from vendor/dafsa*.o + src/*.o).
+          excludes = [ "models", "vendor/ggml" ],
           build = { target = "dl",
                     recipe = [ < Shell = "cp -a \"$FX_SRC\"/. . && make -B dl" > ] } }
       , { name = "dhake", version = "0.1.0", src = < Path = "../../dhake" >,
           deps = [ "dhall-c" ],
+          -- `dist/` is Elm frontend build output; dhake.com builds from
+          -- src/dhake.c + vendor/dhall-c only (cosmocc in the recipe).
+          excludes = [ "dist" ],
           build = { target = "dhake.com",
                     recipe =
                       [ < Shell = "cp -a \"$FX_SRC\"/. . && cosmocc -std=c11 -O2 -g -Wall -Wextra -D_POSIX_C_SOURCE=200809L -I vendor/dhall-c/src -o dhake.com src/dhake.c vendor/dhall-c/src/arena.c vendor/dhall-c/src/lexer.c vendor/dhall-c/src/parser.c vendor/dhall-c/src/ast.c vendor/dhall-c/src/normalize.c vendor/dhall-c/src/typecheck.c vendor/dhall-c/src/builtins.c vendor/dhall-c/src/serialize.c vendor/dhall-c/src/import.c vendor/dhall-c/src/bignum.c vendor/dhall-c/src/sha256.c vendor/dhall-c/src/ssrf.c vendor/dhall-c/src/http.c" > ] } }
       , { name = "compendium", version = "0.1.0", src = < Path = "../../compendium" >,
-          deps = [ "dhall-c" ],
+          deps = [ "dhall-c" ], excludes = [] : List Text,
           build = { target = "dnsd.com",
                     recipe = [ < Shell = "cp -a \"$FX_SRC\"/. . && make -B dnsd.com" > ] } }
       , { name = "visage", version = "0.1.0", src = < Path = "../../visage" >,
-          deps = [ "dhall-c", "datalog-dafsa" ],
+          deps = [ "dhall-c", "datalog-dafsa" ], excludes = [] : List Text,
           build = { target = "visage.com",
                     recipe = [ < Shell = "cp -a \"$FX_SRC\"/. . && make -B visage.com" > ] } }
       ] }

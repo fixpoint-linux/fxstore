@@ -160,7 +160,8 @@ static int compute_paths(const PackageSet *ps, struct dl_db *db,
             char *src_hash = NULL;
             if (p->src.kind == SRC_PATH) {
                 char sh[65];
-                if (fx_content_hash_dir(p->src.path, sh, err, errcap) != 0) {
+                if (fx_content_hash_dir(p->src.path, p->excludes, p->nexcludes,
+                                        sh, err, errcap) != 0) {
                     rc = -1;
                 } else if (!(es[i].src_hash = strdup(sh))) {
                     fx_err(err, errcap, "out of memory");
