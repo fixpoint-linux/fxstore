@@ -103,9 +103,15 @@ fxstore-repro: fxstore
 fxstore-excludes: fxstore
 	@tests/fxstore_excludes.sh ./fxstore
 
-test: fxstore-golden fxstore-sandboxed fxstore-m3 fxstore-repro fxstore-excludes
+# M5 timeline/rollback test: snapshot listing, roll-forward rollback (two new
+# versions), rollback --hard (CURRENT re-mark), and gc --retain N generation
+# GC.  bwrap-free (pure store metadata-db operations).
+fxstore-timeline: fxstore
+	@tests/fxstore_timeline.sh ./fxstore
+
+test: fxstore-golden fxstore-sandboxed fxstore-m3 fxstore-repro fxstore-excludes fxstore-timeline
 
 clean:
 	rm -f fxstore fxstore.aarch64.elf fxstore.com.dbg
 
-.PHONY: all clean test fxstore-golden fxstore-sandboxed fxstore-m3 fxstore-repro fxstore-excludes stage3
+.PHONY: all clean test fxstore-golden fxstore-sandboxed fxstore-m3 fxstore-repro fxstore-excludes fxstore-timeline stage3

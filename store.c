@@ -654,3 +654,330 @@ fail:
     pairbag_free(&pkgs);
     return -1;
 }
+
+/* ─── M5 timeline/rollback: as-of fact reader + roll-forward ────────────── */
+
+/* raw sym-id fact bag over dl_query_version (tuples are interned sym ids that
+ * resolve directly against the live db's shared/persisted interner) */
+typedef struct {
+    uint32_t *tuples;   /* arity * n values */
+    size_t n, cap;
+    uint8_t arity;
+} RawBag;
+
+static int raw_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    RawBag *bag = user;
+    bag->arity = arity;
+    if (bag->n == bag->cap) {
+        bag->cap = bag->cap ? bag->cap * 2 : 16;
+        uint32_t *nt = realloc(bag->tuples, bag->cap * arity * sizeof *nt);
+        if (!nt) return 1;              /* OOM: stop enumeration */
+        bag->tuples = nt;
+    }
+    memcpy(&bag->tuples[bag->n * arity], cols, (size_t)arity * sizeof *cols);
+    bag->n++;
+    return 0;
+}
+
+static void rawbag_free(RawBag *bag) {
+    free(bag->tuples);
+    bag->tuples = NULL; bag->n = bag->cap = 0;
+}
+
+/* Read all facts of `rel` as-of `version`.  A relation ABSENT from that
+ * version (dl_query_version returns -1; older snapshots predate srcstore) is
+ * treated as EMPTY when allow_absent — hard-error only when allow_absent is 0
+ * ('store' is always present in every snapshot). */
+static int version_bag(struct dl_db *db, uint32_t version, const char *rel,
+                       int allow_absent, RawBag *out, char *err, size_t errcap) {
+    memset(out, 0, sizeof *out);
+    long n = dl_query_version(db, version, rel, raw_cb, out);
+    if (n < 0) {
+        if (allow_absent) { rawbag_free(out); return 0; }
+        return fx_err(err, errcap, "snapshot %u has no '%s' relation", version, rel);
+    }
+    return 0;
+}
+
+/* txn helpers: buffer delete/add of every fact in a bag (relations must be
+ * declared; the swap txn below declares them idempotently first). */
+static int txn_delete_bag(struct dl_db *db, const char *rel, const RawBag *bag) {
+    for (size_t i = 0; i < bag->n; i++)
+        if (dl_txn_delete_fact(db, rel, &bag->tuples[i * bag->arity], bag->arity) != 0)
+            return -1;
+    return 0;
+}
+static int txn_add_bag(struct dl_db *db, const char *rel, const RawBag *bag) {
+    for (size_t i = 0; i < bag->n; i++)
+        if (dl_txn_add_fact(db, rel, &bag->tuples[i * bag->arity], bag->arity) != 0)
+            return -1;
+    return 0;
+}
+
+int fx_store_current_version(const FxStore *s, uint32_t *out,
+                             char *err, size_t errcap) {
+    if (!s || !out) return fx_err(err, errcap, "internal: null args");
+    char cur[FX_PATH_MAX];
+    if (snprintf(cur, sizeof cur, "%s/%s/snapshots/CURRENT", s->root, FX_DB_SUBDIR)
+            >= (int)sizeof cur)
+        return fx_err(err, errcap, "CURRENT path too long");
+    FILE *f = fopen(cur, "r");
+    if (f) {
+        unsigned long v = 0;
+        if (fscanf(f, "%lu", &v) == 1 && v > 0 && v <= UINT32_MAX) {
+            fclose(f);
+            *out = (uint32_t)v;
+            return 0;
+        }
+        fclose(f);
+    }
+    /* fall back to the highest published version */
+    long total = dl_snapshot_versions(s->db, NULL, 0);
+    if (total <= 0)
+        return fx_err(err, errcap,
+                      "no published snapshot in the store db — run a build first");
+    uint32_t *vers = malloc((size_t)total * sizeof *vers);
+    if (!vers) return fx_err(err, errcap, "out of memory");
+    dl_snapshot_versions(s->db, vers, (size_t)total);
+    *out = vers[total - 1];
+    free(vers);
+    return 0;
+}
+
+int fx_store_timeline(FxStore *s, char *err, size_t errcap) {
+    if (!s) return fx_err(err, errcap, "internal: null store");
+    long total = dl_snapshot_versions(s->db, NULL, 0);
+    if (total < 0)
+        return fx_err(err, errcap, "cannot enumerate snapshot versions");
+    printf("fxstore: timeline of %s (%ld version(s)):\n", s->root, total);
+    if (total == 0) { printf("  no versions\n"); return 0; }
+
+    uint32_t *vers = malloc((size_t)total * sizeof *vers);
+    if (!vers) return fx_err(err, errcap, "out of memory");
+    dl_snapshot_versions(s->db, vers, (size_t)total);
+
+    uint32_t cur = 0;
+    (void)fx_store_current_version(s, &cur, NULL, 0);   /* best-effort */
+
+    int rc = 0;
+    for (long i = 0; i < total && rc == 0; i++) {
+        uint32_t v = vers[i];
+        RawBag roots = {0}, closure = {0}, store = {0}, srcstore = {0};
+        if (version_bag(s->db, v, "root", 1, &roots, err, errcap) != 0 ||
+            version_bag(s->db, v, "closure", 1, &closure, err, errcap) != 0 ||
+            version_bag(s->db, v, "store", 0, &store, err, errcap) != 0 ||
+            version_bag(s->db, v, "srcstore", 1, &srcstore, err, errcap) != 0) {
+            rc = -1;
+        } else {
+            printf("  %u%s roots: ", v, v == cur ? " [CURRENT]" : "");
+            if (roots.n == 0) {
+                printf("(none)");
+            } else {
+                for (size_t k = 0; k < roots.n; k++) {
+                    const char *nm = dl_intern_str_of(s->db, roots.tuples[k]);
+                    if (k) printf(",");
+                    printf("%s", nm ? nm : "?");
+                }
+            }
+            printf("  closure: %zu  store: %zu  srcstore: %zu\n",
+                   closure.n, store.n, srcstore.n);
+        }
+        rawbag_free(&roots); rawbag_free(&closure);
+        rawbag_free(&store); rawbag_free(&srcstore);
+    }
+    free(vers);
+    return rc;
+}
+
+/* Atomic rewrite of the CURRENT file (write CURRENT.tmp + fsync + rename),
+ * mirroring datalog-dafsa's own atomic CURRENT flip. */
+static int write_current(FxStore *s, uint32_t version, char *err, size_t errcap) {
+    char dir[FX_PATH_MAX], tmp[FX_PATH_MAX], final[FX_PATH_MAX];
+    if (snprintf(dir, sizeof dir, "%s/%s/snapshots", s->root, FX_DB_SUBDIR)
+            >= (int)sizeof dir ||
+        snprintf(tmp, sizeof tmp, "%s/CURRENT.tmp", dir) >= (int)sizeof tmp ||
+        snprintf(final, sizeof final, "%s/CURRENT", dir) >= (int)sizeof final)
+        return fx_err(err, errcap, "snapshot path too long");
+    char buf[32];
+    int len = snprintf(buf, sizeof buf, "%lu\n", (unsigned long)version);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return fx_err(err, errcap, "cannot open '%s': %s", tmp, strerror(errno));
+    ssize_t w = write(fd, buf, (size_t)len);
+    if (w != len || fsync(fd) != 0) {
+        int e = errno;
+        close(fd); remove(tmp);
+        return fx_err(err, errcap, "cannot write '%s': %s", tmp, strerror(e));
+    }
+    close(fd);
+    if (rename(tmp, final) != 0) {
+        int e = errno;
+        remove(tmp);
+        return fx_err(err, errcap, "cannot rename '%s' -> '%s': %s", tmp, final, strerror(e));
+    }
+    return 0;
+}
+
+int fx_store_rollback(FxStore *s, uint32_t version, int hard,
+                      char *err, size_t errcap) {
+    if (!s) return fx_err(err, errcap, "internal: null store");
+
+    /* validate `version` is a published snapshot */
+    long total = dl_snapshot_versions(s->db, NULL, 0);
+    if (total <= 0)
+        return fx_err(err, errcap,
+                      "no published snapshot in the store db — run a build first");
+    uint32_t *vers = malloc((size_t)total * sizeof *vers);
+    if (!vers) return fx_err(err, errcap, "out of memory");
+    dl_snapshot_versions(s->db, vers, (size_t)total);
+    int found = 0;
+    for (long i = 0; i < total && !found; i++) if (vers[i] == version) found = 1;
+    free(vers);
+    if (!found)
+        return fx_err(err, errcap, "no such version %u (have %ld version(s))",
+                      version, total);
+
+    if (hard)
+        return write_current(s, version, err, errcap);
+
+    /* ── roll-forward ── */
+
+    /* 1. PUBLISH FIRST: un-published facts (a crashed build) fold into a
+     * version, and the just-published latest == live (dl_query/dl_count read
+     * the mmap snapshot when snap_version > 0, so the swap below must be
+     * diffed against the published latest, not the live WAL).  This also
+     * preserves the pre-rollback state as an undoable version. */
+    if (dl_publish_snapshot(s->db) != 0)
+        return fx_err(err, errcap, "cannot publish store snapshot before rollback");
+
+    /* 2. read `version`'s store/srcstore/pkg/dep/root facts (NOT closure —
+     * an IDB re-derived below).  srcstore is optional (old snapshots predate
+     * the clean-source work). */
+    RawBag vstore = {0}, vsrcstore = {0}, vpkg = {0}, vdep = {0}, vroot = {0};
+    if (version_bag(s->db, version, "store", 0, &vstore, err, errcap) != 0 ||
+        version_bag(s->db, version, "srcstore", 1, &vsrcstore, err, errcap) != 0 ||
+        version_bag(s->db, version, "pkg", 1, &vpkg, err, errcap) != 0 ||
+        version_bag(s->db, version, "dep", 1, &vdep, err, errcap) != 0 ||
+        version_bag(s->db, version, "root", 1, &vroot, err, errcap) != 0)
+        goto fail;
+
+    /* 3. enumerate the CURRENT (== just-published latest) facts to delete. */
+    {
+        long total2 = dl_snapshot_versions(s->db, NULL, 0);
+        if (total2 <= 0) {
+            fx_err(err, errcap, "no published snapshot after rollback publish");
+            goto fail;
+        }
+        uint32_t *vers2 = malloc((size_t)total2 * sizeof *vers2);
+        if (!vers2) { fx_err(err, errcap, "out of memory"); goto fail; }
+        dl_snapshot_versions(s->db, vers2, (size_t)total2);
+        uint32_t live = vers2[total2 - 1];
+        free(vers2);
+
+        RawBag curstore = {0}, cursrcstore = {0}, curpkg = {0}, curdep = {0}, curroot = {0};
+        if (version_bag(s->db, live, "store", 0, &curstore, err, errcap) != 0 ||
+            version_bag(s->db, live, "srcstore", 1, &cursrcstore, err, errcap) != 0 ||
+            version_bag(s->db, live, "pkg", 1, &curpkg, err, errcap) != 0 ||
+            version_bag(s->db, live, "dep", 1, &curdep, err, errcap) != 0 ||
+            version_bag(s->db, live, "root", 1, &curroot, err, errcap) != 0) {
+            rawbag_free(&curstore); rawbag_free(&cursrcstore);
+            rawbag_free(&curpkg); rawbag_free(&curdep); rawbag_free(&curroot);
+            goto fail;
+        }
+
+        /* 4. declare the swap relations idempotently — guarantees the txn
+         * add/delete succeed even on a freshly re-opened db whose relation
+         * schema is in-memory only (fx_store_open declares store/srcstore;
+         * pkg/dep/root are normally declared by fx_closure_compute). */
+        if (dl_declare_relation(s->db, "store", 2) != 0 ||
+            dl_declare_relation(s->db, "srcstore", 2) != 0 ||
+            dl_declare_relation(s->db, "pkg", 1) != 0 ||
+            dl_declare_relation(s->db, "dep", 2) != 0 ||
+            dl_declare_relation(s->db, "root", 1) != 0) {
+            fx_err(err, errcap, "cannot declare relations for rollback");
+            rawbag_free(&curstore); rawbag_free(&cursrcstore);
+            rawbag_free(&curpkg); rawbag_free(&curdep); rawbag_free(&curroot);
+            goto fail;
+        }
+
+        /* 5. ONE atomic txn: delete every current fact, add every `version`
+         * fact (the atomic index+EDB switch; one WAL + one fsync). */
+        if (dl_txn_begin(s->db) != 0) {
+            fx_err(err, errcap, "txn begin failed (another txn open?)");
+            rawbag_free(&curstore); rawbag_free(&cursrcstore);
+            rawbag_free(&curpkg); rawbag_free(&curdep); rawbag_free(&curroot);
+            goto fail;
+        }
+        if (txn_delete_bag(s->db, "store", &curstore) != 0 ||
+            txn_delete_bag(s->db, "srcstore", &cursrcstore) != 0 ||
+            txn_delete_bag(s->db, "pkg", &curpkg) != 0 ||
+            txn_delete_bag(s->db, "dep", &curdep) != 0 ||
+            txn_delete_bag(s->db, "root", &curroot) != 0 ||
+            txn_add_bag(s->db, "store", &vstore) != 0 ||
+            txn_add_bag(s->db, "srcstore", &vsrcstore) != 0 ||
+            txn_add_bag(s->db, "pkg", &vpkg) != 0 ||
+            txn_add_bag(s->db, "dep", &vdep) != 0 ||
+            txn_add_bag(s->db, "root", &vroot) != 0 ||
+            dl_txn_commit(s->db) != 0) {
+            dl_txn_rollback(s->db);
+            fx_err(err, errcap, "rollback metadata txn failed");
+            rawbag_free(&curstore); rawbag_free(&cursrcstore);
+            rawbag_free(&curpkg); rawbag_free(&curdep); rawbag_free(&curroot);
+            goto fail;
+        }
+        rawbag_free(&curstore); rawbag_free(&cursrcstore);
+        rawbag_free(&curpkg); rawbag_free(&curdep); rawbag_free(&curroot);
+    }
+
+    /* 6. re-derive closure from `version`'s pkg/dep/root.  Re-clearing and
+     * re-adding pkg/dep/root is harmless (the swap already set them); this
+     * re-materializes the fixpoint through dl_load_rules+dl_compile and
+     * publishes a NEW version (the rollback result). */
+    if (fx_closure_rebuild(s->db, vpkg.tuples, vpkg.n, vdep.tuples, vdep.n,
+                           vroot.tuples, vroot.n, err, errcap) != 0)
+        goto fail;
+
+    rawbag_free(&vstore); rawbag_free(&vsrcstore);
+    rawbag_free(&vpkg); rawbag_free(&vdep); rawbag_free(&vroot);
+    return 0;
+fail:
+    rawbag_free(&vstore); rawbag_free(&vsrcstore);
+    rawbag_free(&vpkg); rawbag_free(&vdep); rawbag_free(&vroot);
+    return -1;
+}
+
+int fx_store_gc_retain(FxStore *s, unsigned n, char *err, size_t errcap) {
+    if (!s) return fx_err(err, errcap, "internal: null store");
+    if (n == 0) return fx_err(err, errcap, "gc --retain requires N >= 1");
+    /* Guard the --hard interaction: if CURRENT (from the file) no longer
+     * points at the newest published version, this process's publish would
+     * RENUMBER (new = CURRENT+1) and rm_rf() real snapshot dirs, and the
+     * retention prune could then drop the CURRENT-pointed version — leaving
+     * a dangling CURRENT and shredded history.  Refuse loudly instead. */
+    {
+        uint32_t cur = 0;
+        if (fx_store_current_version(s, &cur, NULL, 0) == 0) {
+            long total = dl_snapshot_versions(s->db, NULL, 0);
+            if (total > 0) {
+                uint32_t *vers = malloc((size_t)total * sizeof *vers);
+                if (vers) {
+                    dl_snapshot_versions(s->db, vers, (size_t)total);
+                    uint32_t newest = vers[total - 1];
+                    free(vers);
+                    if (cur != newest)
+                        return fx_err(err, errcap,
+                                      "CURRENT (%u) is not the newest version (%u) — "
+                                      "a 'rollback --hard' repointed it; fix that first "
+                                      "('fxstore rollback --hard %u'), then retry gc --retain",
+                                      cur, newest, newest);
+                }
+            }
+        }
+    }
+    if (dl_set_snapshot_retain(s->db, n) != 0)
+        return fx_err(err, errcap, "cannot set snapshot retention to %u", n);
+    /* the prune is applied at the END of a successful publish */
+    if (dl_publish_snapshot(s->db) != 0)
+        return fx_err(err, errcap, "cannot publish to apply snapshot retention");
+    return 0;
+}

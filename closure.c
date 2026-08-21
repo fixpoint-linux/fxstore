@@ -80,12 +80,14 @@ static int clear_relation(struct dl_db *db, const char *rel,
     return rc;
 }
 
-/* ─── fx_closure_compute ───────────────────────────────────────────────── */
+/* ─── fx_closure_rebuild — re-derive the fixpoint over given facts ─────── */
 
-int fx_closure_compute(struct dl_db *db, const PackageSet *ps,
-                       char *const *roots, int nroots,
+int fx_closure_rebuild(struct dl_db *db,
+                       const uint32_t *pkg, size_t npkg,
+                       const uint32_t *dep, size_t ndep,
+                       const uint32_t *root, size_t nroot,
                        char *err, size_t errcap) {
-    if (!db || !ps) return fx_err(err, errcap, "internal: null db/package-set");
+    if (!db) return fx_err(err, errcap, "internal: null db");
 
     /* EDB declarations (idempotent).  closure is auto-declared by the rules. */
     if (dl_declare_relation(db, "pkg", 1) != 0)
@@ -95,47 +97,25 @@ int fx_closure_compute(struct dl_db *db, const PackageSet *ps,
     if (dl_declare_relation(db, "root", 1) != 0)
         return fx_err(err, errcap, "cannot declare relation 'root'");
 
-    /* Rebuild the per-run EDB: clear stale facts (previous package set),
-     * including previously materialized closure tuples. */
+    /* Rebuild the per-run EDB: clear stale facts (a previous run / a previous
+     * version's EDB), including previously materialized closure tuples. */
     if (clear_relation(db, "pkg", err, errcap) != 0) return -1;
     if (clear_relation(db, "dep", err, errcap) != 0) return -1;
     if (clear_relation(db, "root", err, errcap) != 0) return -1;
     if (clear_relation(db, "closure", err, errcap) != 0) return -1;
 
-    /* Fresh EDB from the current package set. */
-    for (const Package *p = ps->head; p; p = p->next) {
-        uint32_t sym = dl_intern_str(db, p->name);
-        if (!sym) return fx_err(err, errcap, "out of memory interning '%s'", p->name);
-        if (dl_add_fact(db, "pkg", &sym, 1) < 0)
-            return fx_err(err, errcap, "cannot add pkg('%s')", p->name);
-        for (int i = 0; i < p->ndeps; i++) {
-            uint32_t pair[2] = { dl_intern_str(db, p->name),
-                                 dl_intern_str(db, p->deps[i]) };
-            if (!pair[0] || !pair[1])
-                return fx_err(err, errcap, "out of memory interning dep('%s','%s')",
-                              p->name, p->deps[i]);
-            if (dl_add_fact(db, "dep", pair, 2) < 0)
-                return fx_err(err, errcap, "cannot add dep('%s','%s')", p->name, p->deps[i]);
-        }
+    /* Fresh EDB from the given tuples (already-interned sym_ids). */
+    for (size_t i = 0; i < npkg; i++) {
+        if (dl_add_fact(db, "pkg", &pkg[i], 1) < 0)
+            return fx_err(err, errcap, "cannot add pkg fact");
     }
-
-    /* Roots: the requested build targets, or every package when none. */
-    if (nroots > 0) {
-        for (int i = 0; i < nroots; i++) {
-            if (!fx_find_package(ps, roots[i]))
-                return fx_err(err, errcap, "unknown package '%s' (not in the package set)", roots[i]);
-            uint32_t sym = dl_intern_str(db, roots[i]);
-            if (!sym) return fx_err(err, errcap, "out of memory interning '%s'", roots[i]);
-            if (dl_add_fact(db, "root", &sym, 1) < 0)
-                return fx_err(err, errcap, "cannot add root('%s')", roots[i]);
-        }
-    } else {
-        for (const Package *p = ps->head; p; p = p->next) {
-            uint32_t sym = dl_intern_str(db, p->name);
-            if (!sym) return fx_err(err, errcap, "out of memory interning '%s'", p->name);
-            if (dl_add_fact(db, "root", &sym, 1) < 0)
-                return fx_err(err, errcap, "cannot add root('%s')", p->name);
-        }
+    for (size_t i = 0; i < ndep; i++) {
+        if (dl_add_fact(db, "dep", &dep[i * 2], 2) < 0)
+            return fx_err(err, errcap, "cannot add dep fact");
+    }
+    for (size_t i = 0; i < nroot; i++) {
+        if (dl_add_fact(db, "root", &root[i], 1) < 0)
+            return fx_err(err, errcap, "cannot add root fact");
     }
 
     /* The closure program + compile (materializes closure in-place). */
@@ -148,6 +128,76 @@ int fx_closure_compute(struct dl_db *db, const PackageSet *ps,
     if (dl_publish_snapshot(db) != 0)
         return fx_err(err, errcap, "cannot publish closure snapshot");
     return 0;
+}
+
+/* ─── fx_closure_compute ───────────────────────────────────────────────── */
+
+int fx_closure_compute(struct dl_db *db, const PackageSet *ps,
+                       char *const *roots, int nroots,
+                       char *err, size_t errcap) {
+    if (!db || !ps) return fx_err(err, errcap, "internal: null db/package-set");
+
+    /* First pass: sizes for the fact arrays (pkg arity1, dep arity2 pairs,
+     * root arity1). */
+    size_t npkg = 0, ndep = 0;
+    for (const Package *p = ps->head; p; p = p->next) {
+        npkg++;
+        ndep += (size_t)p->ndeps;
+    }
+    size_t nroot = (size_t)(nroots > 0 ? nroots : ps->count);
+
+    uint32_t *pkg = npkg ? malloc(npkg * sizeof *pkg) : NULL;
+    uint32_t *dep = ndep ? malloc(ndep * 2 * sizeof *dep) : NULL;
+    uint32_t *root = nroot ? malloc(nroot * sizeof *root) : NULL;
+    if ((npkg && !pkg) || (ndep && !dep) || (nroot && !root)) {
+        free(pkg); free(dep); free(root);
+        return fx_err(err, errcap, "out of memory");
+    }
+
+    /* Fill pkg + dep from the current package set (interned syms). */
+    size_t ip = 0, id = 0;
+    for (const Package *p = ps->head; p; p = p->next) {
+        uint32_t sym = dl_intern_str(db, p->name);
+        if (!sym) goto oom_intern;
+        pkg[ip++] = sym;
+        for (int i = 0; i < p->ndeps; i++) {
+            uint32_t pair[2] = { dl_intern_str(db, p->name),
+                                 dl_intern_str(db, p->deps[i]) };
+            if (!pair[0] || !pair[1]) goto oom_intern;
+            dep[id * 2] = pair[0];
+            dep[id * 2 + 1] = pair[1];
+            id++;
+        }
+    }
+
+    /* Roots: the requested build targets, or every package when none. */
+    size_t ir = 0;
+    if (nroots > 0) {
+        for (int i = 0; i < nroots; i++) {
+            if (!fx_find_package(ps, roots[i])) {
+                free(pkg); free(dep); free(root);
+                return fx_err(err, errcap,
+                              "unknown package '%s' (not in the package set)", roots[i]);
+            }
+            uint32_t sym = dl_intern_str(db, roots[i]);
+            if (!sym) goto oom_intern;
+            root[ir++] = sym;
+        }
+    } else {
+        for (const Package *p = ps->head; p; p = p->next) {
+            uint32_t sym = dl_intern_str(db, p->name);
+            if (!sym) goto oom_intern;
+            root[ir++] = sym;
+        }
+    }
+
+    int rc = fx_closure_rebuild(db, pkg, ip, dep, id, root, ir, err, errcap);
+    free(pkg); free(dep); free(root);
+    return rc;
+
+oom_intern:
+    free(pkg); free(dep); free(root);
+    return fx_err(err, errcap, "out of memory interning package name");
 }
 
 /* ─── fx_closure_names ─────────────────────────────────────────────────── */

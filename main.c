@@ -4,7 +4,13 @@
  *   fxstore build [--store DIR] [<pkg>...]  build the closure of <pkg>... (all when none)
  *                                       into the store at DIR, print each store path
  *   fxstore query <pkg> [--store DIR]   print <pkg>'s closure names + its store path
- *   fxstore gc <root> [--store DIR]     prune store dirs/facts unreachable from <root>
+ *   fxstore gc [<root>] [--retain N] [--store DIR]
+ *                                       prune store dirs/facts unreachable from <root>
+ *                                       (--retain N: keep the N most-recent snapshots)
+ *   fxstore timeline [--store DIR]      list every snapshot version, marking CURRENT
+ *   fxstore rollback [--hard] <v> [--store DIR]
+ *                                       roll the store back to snapshot version <v>
+ *                                       (default roll-forward; --hard repoints CURRENT)
  *
  * Glue over the five core units: package-set walker (packageset.c), canonical
  * serializer + sha256 store path (derivation.c), datalog closure fixpoint +
@@ -39,9 +45,18 @@ static void usage(FILE *out) {
         "  fxstore build [--store DIR] [<pkg>...]  build the closure of <pkg>...\n"
         "                                          (all packages when none), print store paths\n"
         "  fxstore query <pkg> [--store DIR]      print <pkg>'s closure names + store path\n"
-        "  fxstore gc <root> [--store DIR]        prune store dirs/facts unreachable from <root>\n"
+        "  fxstore gc [<root>] [--retain N] [--store DIR]\n"
+        "                                          prune store dirs/facts unreachable from <root>\n"
+        "                                          (--retain N: keep N most-recent snapshots instead)\n"
+        "  fxstore timeline [--store DIR]         list every snapshot version, marking CURRENT\n"
+        "  fxstore rollback [--hard] <v> [--store DIR]\n"
+        "                                          roll the store back to snapshot version <v>\n"
+        "                                          (default roll-forward; --hard repoints CURRENT)\n"
         "options:\n"
         "  --store DIR   store root (default: %s)\n"
+        "  --retain N    (gc) keep the N most-recent snapshot versions, prune the rest\n"
+        "  -n N          same as --retain N\n"
+        "  --hard        (rollback) recovery-only: repoint CURRENT directly at <v>, no new version\n"
         "  -h, --help    show this help\n"
         "build/query load \"package-set.dhall\" from the current directory.\n",
         DEFAULT_STORE_ROOT);
@@ -53,6 +68,9 @@ typedef struct {
     const char *store_root;   /* NULL when not given */
     char **pos;               /* positional args (borrowed pointers) */
     int npos;
+    int hard;                 /* --hard (rollback) */
+    unsigned retain;          /* --retain N / -n N (gc) */
+    int has_retain;           /* --retain was given */
 } CliArgs;
 
 /* Parse argv[start..argc).  Strips --store DIR / --store=DIR and -h/--help.
@@ -73,6 +91,35 @@ static int parse_args(char **argv, int argc, int start, CliArgs *c) {
             c->store_root = argv[++i];
         } else if (!strncmp(a, "--store=", 8)) {
             c->store_root = a + 8;
+        } else if (!strcmp(a, "--hard")) {
+            c->hard = 1;
+        } else if (!strcmp(a, "--retain") || !strcmp(a, "-n")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "fxstore: %s requires a count argument\n", a);
+                free(c->pos); c->pos = NULL;
+                return -1;
+            }
+            const char *val = argv[++i];
+            char *end = NULL;
+            long n = strtol(val, &end, 10);
+            if (!end || *end != '\0' || n <= 0 || n > 1000000) {
+                fprintf(stderr, "fxstore: invalid --retain count '%s' (expected a positive integer)\n", val);
+                free(c->pos); c->pos = NULL;
+                return -1;
+            }
+            c->retain = (unsigned)n;
+            c->has_retain = 1;
+        } else if (!strncmp(a, "--retain=", 9)) {
+            const char *val = a + 9;
+            char *end = NULL;
+            long n = strtol(val, &end, 10);
+            if (!end || *end != '\0' || n <= 0 || n > 1000000) {
+                fprintf(stderr, "fxstore: invalid --retain count '%s' (expected a positive integer)\n", val);
+                free(c->pos); c->pos = NULL;
+                return -1;
+            }
+            c->retain = (unsigned)n;
+            c->has_retain = 1;
         } else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
             usage(stdout);
             free(c->pos); c->pos = NULL;
@@ -369,13 +416,18 @@ static int cmd_gc(char **argv, int argc, int start) {
     CliArgs c;
     int pr = parse_args(argv, argc, start, &c);
     if (pr != 0) { if (pr == 1) return 0; return 2; }
-    if (c.npos != 1) {
-        fprintf(stderr, "fxstore: gc requires exactly one root package\n\n");
+    if (!c.has_retain && c.npos != 1) {
+        fprintf(stderr, "fxstore: gc requires exactly one root package (or --retain N)\n\n");
         cli_free(&c);
         usage(stderr);
         return 2;
     }
-    const char *root = c.pos[0];
+    if (c.has_retain && c.npos > 1) {
+        fprintf(stderr, "fxstore: gc accepts at most one root package\n\n");
+        cli_free(&c);
+        usage(stderr);
+        return 2;
+    }
     const char *store_root = c.store_root ? c.store_root : DEFAULT_STORE_ROOT;
 
     char err[ERR_CAP];
@@ -385,7 +437,80 @@ static int cmd_gc(char **argv, int argc, int start) {
         cli_free(&c);
         return 1;
     }
-    int rc = fx_store_gc(s, root, err, sizeof err);
+    int rc = 0;
+    if (c.has_retain) {
+        /* generation GC: prune to the N most-recent snapshot versions */
+        if (fx_store_gc_retain(s, c.retain, err, sizeof err) != 0) {
+            fprintf(stderr, "fxstore: %s\n", err);
+            rc = 1;
+        }
+    }
+    if (rc == 0 && c.npos == 1) {
+        /* dir-level GC relative to a root (may follow --retain) */
+        if (fx_store_gc(s, c.pos[0], err, sizeof err) != 0) {
+            fprintf(stderr, "fxstore: %s\n", err);
+            rc = 1;
+        }
+    }
+    fx_store_close(s);
+    cli_free(&c);
+    return rc != 0 ? 1 : 0;
+}
+
+static int cmd_timeline(char **argv, int argc, int start) {
+    CliArgs c;
+    int pr = parse_args(argv, argc, start, &c);
+    if (pr != 0) { if (pr == 1) return 0; return 2; }
+    if (c.npos != 0) {
+        fprintf(stderr, "fxstore: timeline takes no arguments\n\n");
+        cli_free(&c);
+        usage(stderr);
+        return 2;
+    }
+    const char *store_root = c.store_root ? c.store_root : DEFAULT_STORE_ROOT;
+
+    char err[ERR_CAP];
+    FxStore *s = fx_store_open(store_root, err, sizeof err);
+    if (!s) {
+        fprintf(stderr, "fxstore: %s\n", err);
+        cli_free(&c);
+        return 1;
+    }
+    int rc = fx_store_timeline(s, err, sizeof err);
+    if (rc != 0) fprintf(stderr, "fxstore: %s\n", err);
+    fx_store_close(s);
+    cli_free(&c);
+    return rc != 0 ? 1 : 0;
+}
+
+static int cmd_rollback(char **argv, int argc, int start) {
+    CliArgs c;
+    int pr = parse_args(argv, argc, start, &c);
+    if (pr != 0) { if (pr == 1) return 0; return 2; }
+    if (c.npos != 1) {
+        fprintf(stderr, "fxstore: rollback requires exactly one version number\n\n");
+        cli_free(&c);
+        usage(stderr);
+        return 2;
+    }
+    const char *vs = c.pos[0];
+    char *end = NULL;
+    long v = strtol(vs, &end, 10);
+    if (!end || *end != '\0' || v <= 0 || (unsigned long)v > 0xFFFFFFFFUL) {
+        fprintf(stderr, "fxstore: invalid version '%s' (expected an integer in 1..4294967295)\n", vs);
+        cli_free(&c);
+        return 2;
+    }
+    const char *store_root = c.store_root ? c.store_root : DEFAULT_STORE_ROOT;
+
+    char err[ERR_CAP];
+    FxStore *s = fx_store_open(store_root, err, sizeof err);
+    if (!s) {
+        fprintf(stderr, "fxstore: %s\n", err);
+        cli_free(&c);
+        return 1;
+    }
+    int rc = fx_store_rollback(s, (uint32_t)v, c.hard, err, sizeof err);
     if (rc != 0) fprintf(stderr, "fxstore: %s\n", err);
     fx_store_close(s);
     cli_free(&c);
@@ -519,6 +644,8 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "build") == 0) return cmd_build(argv, argc, 2);
     if (strcmp(cmd, "query") == 0) return cmd_query(argv, argc, 2);
     if (strcmp(cmd, "gc") == 0) return cmd_gc(argv, argc, 2);
+    if (strcmp(cmd, "timeline") == 0) return cmd_timeline(argv, argc, 2);
+    if (strcmp(cmd, "rollback") == 0) return cmd_rollback(argv, argc, 2);
 
     fprintf(stderr, "fxstore: unknown command '%s'\n\n", cmd);
     usage(stderr);

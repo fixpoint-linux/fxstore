@@ -219,6 +219,23 @@ int fx_closure_compute(struct dl_db *db, const PackageSet *ps,
 int fx_closure_names(struct dl_db *db, char ***names_out, int *n_out,
                      char *err, size_t errcap);
 
+/* Rebuild the closure fixpoint over the GIVEN fact tuples (already-interned
+ * sym_ids, shared/persisted interner — so sym_ids from any published snapshot
+ * resolve directly against the live db): declares pkg/dep/root idempotently,
+ * clears stale pkg/dep/root/closure facts, adds the given tuples, then loads +
+ * compiles FX_CLOSURE_RULES and publishes a snapshot.  `pkg`/`root` are arity-1
+ * (npkg/nroot uint32 each), `dep` is arity-2 (ndep PAIRS, dep[i*2]=from,
+ * dep[i*2+1]=to).  This is the tail of fx_closure_compute factored out so
+ * fx_store_rollback can re-derive `closure` from an OLD snapshot's EDB facts.
+ * CRITICAL: closure is an IDB relation (base != view), so it must be
+ * re-materialized here through dl_load_rules + dl_compile — NEVER restored by
+ * dl_txn_add_fact on 'closure' (that silently yields a stale rollback view). */
+int fx_closure_rebuild(struct dl_db *db,
+                       const uint32_t *pkg, size_t npkg,
+                       const uint32_t *dep, size_t ndep,
+                       const uint32_t *root, size_t nroot,
+                       char *err, size_t errcap);
+
 /* Topo-sort `names` (a subset of the package set, typically the closure) so
  * every package follows its deps; reject cycles ("no finite store path")
  * and deps outside the given name set.  Returns a malloc'd array of
@@ -286,6 +303,49 @@ int fx_store_build(FxStore *s, const Package *p, const char *hash,
  * deleted.  Deleting facts before dirs keeps the crash invariant: a crash
  * mid-GC leaves reapable orphan dirs, never dangling metadata. */
 int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap);
+
+/* M5 — timeline & rollback over datalog-dafsa's snapshot time-travel.  Every
+ * published snapshot captures store(hash,name), srcstore(hash,name),
+ * pkg(name), dep(from,to), root(name), closure(name), so these commands work
+ * with the store alone (no package-set.dhall present). */
+
+/* Read the CURRENT snapshot version: best-effort parse of
+ * <root>/.db/snapshots/CURRENT (the file dl_publish_snapshot maintains),
+ * falling back to the highest published version when the file is unreadable.
+ * Returns 0/-1 (a store with no published snapshot is an error). */
+int fx_store_current_version(const FxStore *s, uint32_t *out,
+                             char *err, size_t errcap);
+
+/* Print a machine-parseable timeline of every published snapshot version,
+ * one version per line:
+ *     <v> [CURRENT] roots: <n1>,<n2>  closure: <k>  store: <s>  srcstore: <t>
+ * (empty roots -> "roots: (none)").  Prints "no versions" when the store has
+ * no published snapshot.  Returns 0/-1. */
+int fx_store_timeline(FxStore *s, char *err, size_t errcap);
+
+/* Roll back the store to a previously published snapshot version `version`.
+ *   hard == 0 (default, roll-forward): publish the current state FIRST (so
+ *     un-published facts fold into a version and pre-rollback state is
+ *     preserved as an undoable version), then in ONE atomic txn replace every
+ *     current store/srcstore/pkg/dep/root fact with `version`'s, then
+ *     re-derive `closure` via fx_closure_rebuild.  Result: two new versions,
+ *     CURRENT advances monotonically, undoable.  Never deletes artifact dirs
+ *     (dirs that become orphans are reaped by `gc <root>`).
+ *   hard == 1 (recovery-only): atomically rewrite the CURRENT file to point
+ *     directly at `version`; no new version, no fact mutation, breaks
+ *     monotonicity.  DOCUMENTED DANGER: a later `gc --retain N` prunes by
+ *     number of most-recent versions and could prune a --hard-repointed
+ *     version, leaving a dangling CURRENT.
+ * Returns 0/-1. */
+int fx_store_rollback(FxStore *s, uint32_t version, int hard,
+                      char *err, size_t errcap);
+
+/* Generation GC: keep at most `n` most-recent snapshot versions, pruning the
+ * rest (dl_set_snapshot_retain + dl_publish_snapshot; prune happens at the end
+ * of the successful publish).  One-shot prune of snapshot VERSION dirs only —
+ * it does NOT prune artifact store dirs (use `gc <root>` for that), and it
+ * trades away rollback history.  Returns 0/-1. */
+int fx_store_gc_retain(FxStore *s, unsigned n, char *err, size_t errcap);
 
 /* ─── U5: build.c — recipe executor + bwrap/stage3 sandbox ───────────── */
 
