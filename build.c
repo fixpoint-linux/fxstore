@@ -417,6 +417,13 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
          * other mount op.  The store and src keep their HOST paths: deps
          * are reached via FX_DEP_* store paths, and recipes reference the
          * src tree by path. */
+        /* --tmpfs /build FIRST: bwrap applies mounts in argv order and the
+         * root is bound read-only (--ro-bind / /), so it cannot auto-create
+         * the /build mountpoint for the workdir bind — a tmpfs does it for
+         * us (verified on a btrfs-root host), then the workdir rw bind
+         * overlays it.  Without this, bwrap dies "Can't mkdir /build:
+         * Read-only file system". */
+        PUSH("--tmpfs"); PUSH("/build");
         PUSH("--bind"); PUSH(workdir); PUSH("/build");
         PUSH("--chdir"); PUSH("/build");
         PUSH("--dev"); PUSH("/dev");
