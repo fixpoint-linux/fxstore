@@ -246,6 +246,7 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap);
  * the Env action, and this must already be settled when they run. */
 void fx_stage3_resolve(void);
 void fx_bwrap_resolve(void);
+void fx_cosmo_resolve(void);
 
 /* Execute the package's recipe inside `workdir` (the temp build dir under
  * <store_root>.build, a SIBLING of the store — never inside it):

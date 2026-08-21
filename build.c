@@ -244,6 +244,72 @@ void fx_bwrap_resolve(void) {
     }
 }
 
+/* Resolved cosmocc toolchain install root (e.g. ~/.local/cosmo) and its
+ * bin/ subdir.  Resolved EXACTLY ONCE at startup (mirrors fx_stage3_resolve /
+ * fx_bwrap_resolve): the FXSTORE_COSMO environment override wins if set,
+ * else cosmocc is discovered via PATH (realpath'd so the Landlock unveil and
+ * the ro-bind use the resolved path, then stripped twice to climb from
+ * .../bin/cosmocc to the install root).  The root/bin stay NULL when cosmocc
+ * is NOT resolvable — the sandbox then makes no cosmo spec/bind/PATH change
+ * (graceful absence: builds and tests without a cosmo toolchain on PATH are
+ * unaffected).  Resolving once at startup (before any recipe Env action can
+ * alter PATH) keeps the lookup PATH-hijack-resistant. */
+static const char *g_cosmo_root;   /* install tree root, e.g. /home/u/.local/cosmo */
+static const char *g_cosmo_bin;    /* <root>/bin */
+
+void fx_cosmo_resolve(void) {
+    if (g_cosmo_root) return;
+    const char *ov = getenv("FXSTORE_COSMO");          /* explicit override wins */
+    char *root = NULL;
+    if (ov && *ov) {
+        /* Validate the override the way the discover path validates its
+         * result: it must be an ABSOLUTE path and, after realpath, must
+         * not collapse to the filesystem root.  Both bad shapes are
+         * rejected to graceful absence (root stays NULL):
+         *   - relative: a relative root leaks into the LANDLOCK_SPEC as a
+         *     cwd-relative entry and prepends a relative g_cosmo_bin to
+         *     PATH, so `cosmocc` resolves against the RECIPE'S rw workdir
+         *     — a planted bin/cosmocc there would be exec'd, defeating the
+         *     PATH-hijack lock.
+         *   - "/": build_landlock_spec would append "/:rx", unveiling the
+         *     ENTIRE host fs read+exec — the exact regression its comment
+         *     forbids ("never /:r"), here reachable from an override.
+         * realpath also rejects nonexistent overrides and canonicalizes
+         * symlinks, matching the discover branch. */
+        char real[PATH_MAX];
+        if (ov[0] == '/' && realpath(ov, real) && strcmp(real, "/") != 0)
+            root = strdup(real);
+    } else {
+        const char *path = getenv("PATH");
+        char *dup = path ? strdup(path) : NULL;
+        if (dup) {
+            for (char *tok = strtok(dup, ":"); tok; tok = strtok(NULL, ":")) {
+                char cand[PATH_MAX];
+                if (*tok && snprintf(cand, sizeof cand, "%s/cosmocc", tok) < (int)sizeof cand
+                    && access(cand, X_OK) == 0) {
+                    char real[PATH_MAX];
+                    if (realpath(cand, real)) {
+                        /* real = .../cosmo/bin/cosmocc -> strip file, then bin/ */
+                        char *dir = strdup(real);
+                        char *s = dir ? strrchr(dir, '/') : NULL;
+                        if (s) { *s = '\0'; s = strrchr(dir, '/'); if (s) *s = '\0'; }
+                        /* dir is now .../cosmo (the install root) */
+                        if (dir && *dir) root = strdup(dir);
+                        free(dir);
+                    }
+                    break;
+                }
+            }
+            free(dup);
+        }
+    }
+    if (!root || !root[0]) { free(root); return; }     /* graceful absence */
+    g_cosmo_root = root;
+    size_t nb = strlen(root) + 5;                      /* "/bin" + NUL */
+    char *bb = malloc(nb);
+    if (bb) { snprintf(bb, nb, "%s/bin", root); g_cosmo_bin = bb; }
+}
+
 /* Drop every RATTAN_* and LD_* variable from the (fork'd child's)
  * environment before exec.  stage3 reads RATTAN_ALLOW_PTRACE=1 as "skip
  * seccomp entirely" and RATTAN_EXTRA_PROMISES/RATTAN_RLIMITS as config;
@@ -274,10 +340,10 @@ static void scrub_env(void) {
     free(drop);
 }
 
-/* stage3 parses LANDLOCK_SPEC through a fixed 256-byte buffer and dies on
- * anything longer; use the same limit here so an oversized spec fails with
- * OUR message instead of stage3's. */
-#define FX_LANDLOCK_SPEC_MAX 256
+/* stage3 parses LANDLOCK_SPEC through a fixed buffer (its MAX_ENV, 512 since
+ * M3) and dies on anything longer; use the same limit here so an oversized
+ * spec fails with OUR message instead of stage3's. */
+#define FX_LANDLOCK_SPEC_MAX 512
 
 /* Append "path:perms" (with a ';' separator) to buf at *off.  Returns 0 on
  * success, -1 when it would not fit in cap (path NULL/"" is a skip, not an
@@ -313,7 +379,7 @@ static int spec_append(char *buf, size_t cap, size_t *off, int *first,
  * /proc, /tmp cover the runtime needs of the mounted dev/proc and the fresh
  * --tmpfs /tmp.  Every unveiled path is bind/tmpfs-mounted (or the toolchain
  * ro-binds), so it exists inside the namespace.  The buffer is capped at
- * FX_LANDLOCK_SPEC_MAX (stage3's own 256-byte limit) — a longer spec fails
+ * FX_LANDLOCK_SPEC_MAX (stage3's own MAX_ENV limit) — a longer spec fails
  * closed with OUR message rather than stage3's.  Returns a malloc'd spec, or
  * NULL when it would
  * not fit (caller fails LOUDLY — fail closed, never truncate). */
@@ -330,6 +396,11 @@ static char *build_landlock_spec(const char *src_ro, const char *store_root,
         spec_append(buf, sizeof buf, &off, &first, "/lib",     "rx") != 0 ||
         (is_dir2("/lib64") &&
          spec_append(buf, sizeof buf, &off, &first, "/lib64", "rx") != 0) ||
+        /* the cosmocc toolchain tree (when resolvable) is unveiled read-only
+         * (rx) — recipes exec cosmocc (make's CC) from it but cannot write
+         * to it.  Skipped (graceful absence) when cosmocc is not on PATH. */
+        (g_cosmo_root &&
+         spec_append(buf, sizeof buf, &off, &first, g_cosmo_root, "rx") != 0) ||
         spec_append(buf, sizeof buf, &off, &first, "/dev",     "rwc") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/proc",    "r") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/tmp",     "rwc") != 0)
@@ -353,6 +424,20 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         /* ── child ── nothing below may degrade into a LESS-sandboxed exec:
          * stage3 must be reachable or we die (127) LOUDLY. */
         scrub_env();
+        /* Prepend the cosmocc bin/ to PATH (when resolvable) so `cosmocc`
+         * resolves inside the sandbox — the toolchain's install tree is
+         * ro-bind + Landlock-unveiled below.  No-op when cosmocc is absent
+         * (graceful). */
+        if (g_cosmo_bin) {
+            const char *oldp = getenv("PATH");
+            size_t n = strlen(g_cosmo_bin) + 1 + (oldp ? strlen(oldp) : 0) + 1;
+            char *np = malloc(n);
+            if (np) {
+                snprintf(np, n, "%s:%s", g_cosmo_bin, oldp ? oldp : "");
+                setenv("PATH", np, 1);
+                free(np);
+            }
+        }
         char *spec = build_landlock_spec(src_ro, store_root, workdir);
         if (!spec) {
             fprintf(stderr, "fxstore: cannot build LANDLOCK_SPEC for this build "
@@ -407,6 +492,10 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         PUSH("--ro-bind"); PUSH("/lib"); PUSH("/lib");
         if (is_dir2("/lib64")) { PUSH("--ro-bind"); PUSH("/lib64"); PUSH("/lib64"); }
         if (src_ro && src_ro[0]) { PUSH("--ro-bind"); PUSH(src_ro); PUSH(src_ro); }
+        /* cosmocc toolchain tree, ro-bind at its REAL host path (belt-and-
+         * suspenders on top of the Landlock :rx unveil above — it exists
+         * under the ro-bound root, so no mountpoint synthesis is needed). */
+        if (g_cosmo_root) { PUSH("--ro-bind"); PUSH(g_cosmo_root); PUSH(g_cosmo_root); }
         /* workdir (under <store_root>.build) is OUTSIDE the ro-bound store:
          * a rw bind nested under a ro bind is unconstructable in bwrap, so
          * store.c relocates the scratch dir to a sibling of the store.  It
@@ -667,16 +756,21 @@ int fx_build_recipe(const Package *p, const char *workdir,
     EnvSnap snap;
     env_snap(&snap);
 
+    /* Path sources are mounted read-only into the sandbox at their own
+       path; Fetch sources have no local tree (network is off in the
+       sandbox; fetching is post-MVP). */
+    const char *src_ro = (p->src.kind == SRC_PATH) ? p->src.path : NULL;
+
     if (set_dep_env(dep_names, dep_paths, ndeps) != 0) {
         env_restore(&snap);
         env_snap_free(&snap);
         return fx_err(err, errcap, "out of memory setting FX_DEP_* env");
     }
 
-    /* Path sources are mounted read-only into the sandbox at their own
-       path; Fetch sources have no local tree (network is off in the
-       sandbox; fetching is post-MVP). */
-    const char *src_ro = (p->src.kind == SRC_PATH) ? p->src.path : NULL;
+    /* Export the ro-bound source tree as FX_SRC so recipes can
+     * `cp -a "$FX_SRC"/. .` to copy it into the rw workdir.  Cleared on exit
+     * by env_restore (like FX_DEP_*), so it never leaks across packages. */
+    if (src_ro) setenv("FX_SRC", src_ro, 1);
 
     int rc = 0;
     for (Action *a = p->recipe; a; a = a->next) {

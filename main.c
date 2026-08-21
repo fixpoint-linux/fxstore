@@ -470,6 +470,7 @@ int main(int argc, char **argv) {
      * and the FXSTORE_STAGE3 override must be settled before they run. */
     fx_stage3_resolve();
     fx_bwrap_resolve();      /* lock the bwrap path before recipes run */
+    fx_cosmo_resolve();      /* lock the cosmocc toolchain tree before recipes run */
 
     if (!cmd || !strcmp(cmd, "-h") || !strcmp(cmd, "--help")) {
         usage(cmd ? stdout : stderr);
