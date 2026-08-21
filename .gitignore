@@ -1,3 +1,11 @@
 fxstore
 fxstore.aarch64.elf
 fxstore.com.dbg
+
+# Elm docs app — tooling and generated build output (never committed).
+node_modules/
+elm-stuff/
+dist/
+
+# mfe-framework dist (built from submodule at deploy time; served here)
+/vendor/@mfe/

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fxstore — a content-addressed build store for fixpoint-linux</title>
+<meta name="description" content="fxstore: a content-addressed build store — Dhall package set, datalog-dafsa closure fixed point, /fx/store content-addressed paths. Built with cosmocc. Part of fixpoint-linux.">
+<script type="importmap">
+{
+  "imports": {
+    "@mfe/core": "./vendor/@mfe/core/index.js",
+    "@mfe/framework": "./vendor/@mfe/framework/index.js",
+    "fxstore-page": "./shell/mfe/fxstore-page.js",
+    "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app" ssr>
+  <div class="fixpoint-root">
+    <div data-mfe="fxstore-page"><!-- ssg.mjs injects the pre-rendered fxstore page markup here --></div>
+  </div>
+</div>
+<script type="module" src="./shell/shell.js"></script>
+</body>
+</html>

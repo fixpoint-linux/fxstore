@@ -1,0 +1,29 @@
+{
+    "name": "fxstore",
+    "version": "1.0.0",
+    "description": "**fxstore** is a content-addressed build store for fixpoint-linux. It reads a `package-set.dhall`, computes the dependency closure as a least fixed point with `datalog-dafsa`, and gives every package a deterministic, content-addressed home in the store.",
+    "main": "index.js",
+    "directories": {
+        "doc": "dist",
+        "test": "tests"
+    },
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "build": "./dhake/dhake.com dist/index.html"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/fixpoint-linux/fxstore.git"
+    },
+    "keywords": [],
+    "type": "commonjs",
+    "bugs": {
+        "url": "https://github.com/fixpoint-linux/fxstore/issues"
+    },
+    "homepage": "https://github.com/fixpoint-linux/fxstore#readme",
+    "devDependencies": {
+        "elm": "^0.19.2-0",
+        "elm-format": "^0.8.8",
+        "happy-dom": "^20.11.6"
+    }
+}
