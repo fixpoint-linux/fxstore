@@ -89,7 +89,9 @@ typedef struct Package {
     char **deps;           /* direct dep NAMES, package-set order */
     int ndeps;
     char **excludes;       /* optional RELATIVE-PATH-PREFIX exclusions within
-                              the src tree; applied on top of the global
+                              the src tree (only valid for a Path src — a
+                              Fetch src is content-addressed by its own url+
+                              hash); applied on top of the global
                               fx_clean_excluded table, in BOTH hash and copy
                               modes.  NULL/0 when absent.  Entries are
                               validated at load (clean relative paths only). */
@@ -137,8 +139,9 @@ void fx_packageset_free(PackageSet *ps);
  * modes so hash==copy.  A child with relative path `rel` is excluded if
  * rel==entry or rel starts with entry+"/".  Empty list (NULL/0) = the global
  * table alone.
- *   fx_clean_tree(dir, dst, NULL, 0, ...)     hash-only walk
- *   fx_clean_tree(dir, dst, ex, nx, ...)      copy+hash in one pass (dst dir
+ * The MODE (hash-only vs copy) is chosen by `dst`, NOT by the excludes args:
+ *   fx_clean_tree(dir, NULL, ex, nx, ...)    hash-only walk (dst==NULL)
+ *   fx_clean_tree(dir, dst,  ex, nx, ...)    copy+hash in one pass (dst dir
  *                                             must already exist)
  * fx_content_hash_dir is the thin hash-only wrapper. */
 int fx_clean_tree(const char *dir, const char *dst,

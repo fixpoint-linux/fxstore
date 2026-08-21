@@ -321,6 +321,13 @@ static Package *map_package(Term *rec, const char *base_dir, char *err, size_t e
                 p->excludes[j++] = x;
             }
         }
+        /* excludes only apply to a local src TREE (SRC_PATH); on a Fetch
+           source (url+hash) they would be silently ignored, so reject them
+           loudly rather than let the author think the exclusion took effect. */
+        if (p->nexcludes > 0 && p->src.kind != SRC_PATH) {
+            fx_err(err, errcap, "%s: 'excludes' is only valid for a Path src (Fetch src is content-addressed by its own url+hash)", where);
+            goto fail;
+        }
     }
 
     Term *build = rec_get(rec, "build");
