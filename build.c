@@ -9,13 +9,25 @@
  *   (b) the two EXECUTING actions (Shell, Run) run under a bwrap sandbox
  *       with the palisade stage3 inner binary (vendor/palisade) as /init:
  *         bwrap --unshare-all --die-with-parent --uid 1000 --gid 1000
+ *               --tmpfs /tmp (FIRST mount op: bwrap applies mounts in argv
+ *                order, so a tmpfs pushed after the binds would shadow any
+ *                store/src/workdir placed under /tmp; bind SOURCES resolve
+ *                in the original namespace, so tmpfs-first never hides them)
  *               [binds: ro-bind store, /usr /bin /lib [/lib64], ro-bind src,
- *                bind workdir, --dev /dev, --proc /proc, ro-bind stage3 /init]
+ *                bind workdir -> /build, --dev /dev, --proc /proc,
+ *                ro-bind stage3 /init]
  *               -- /init <PROMISES> <LANDLOCK_SPEC> -- <real_argv...>
  *       stage3 (applied no_new_privs -> Landlock -> rlimits -> seccomp, in
  *       that order) hardens the bwrap namespaces: the recipe's syscalls are
  *       whitelist-filtered (pledge) and the filesystem is unveil()ed down
- *       to exactly the bind-mounted paths (Landlock).  The
+ *       to exactly the bind-mounted paths (Landlock).  workdir is the
+ *       package's scratch dir under <store_root>.build — a SIBLING of the
+ *       store, rw-bound at the short fixed path /build: bwrap constructs a
+ *       rw bind by mkdir()ing the missing destination at mount time through
+ *       the mounts already in place, which a read-only ancestor makes
+ *       impossible ("Can't chdir"/"Can't mkdir"), and the long host scratch
+ *       path (store + ".build/" + 64 hex + name + pid) would eat stage3's
+ *       256-byte LANDLOCK_SPEC budget.  The
  *       pure-filesystem actions (Copy/Mkdir/Rm/Touch/Move/Symlink/Chmod/
  *       Echo/Env) are trusted declarative ops and run in-process without
  *       a sandbox.
@@ -209,7 +221,7 @@ static const char *stage3_bin(void) {
 /* Resolved absolute bwrap path (NULL when not resolvable at startup).
  * Looked up ONCE, before any recipe Env action runs: execvp("bwrap")
  * searches the CURRENT PATH, which recipes control — a recipe could plant
- * a fake `bwrap` in /tmp (unveiled rwc) or the workdir (rwcx) and redirect
+ * a fake `bwrap` in /tmp (unveiled rwc) or the workdir (rwcx via /build) and redirect
  * PATH to it, substituting the sandbox layer itself. The child execs this
  * ABSOLUTE path (no PATH search); NULL means take the LOUD fallback branch
  * directly. */
@@ -288,24 +300,30 @@ static int spec_append(char *buf, size_t cap, size_t *off, int *first,
  * invocation.  SECURITY: unveils ONLY the bind-mounted paths — never "/:r"
  * (fxstore's bwrap keeps the HOST / as the sandbox root; "/:r" would grant
  * recipes read access to the entire host filesystem — a regression vs the
- * bind-only isolation).  /lib64 is included exactly when it is bind-
- * mounted (is_dir2), so every unveiled path exists inside the sandbox —
- * stage3's unveil() on a missing path dies.  workdir gets rwcx (builds exec
- * ./configure and write their own artifacts, mirroring rattan's exec-
- * workspace choice); src_ro is rx (read + exec); store_root is r.  /dev,
- * /proc, /tmp cover the runtime needs of the mounted dev/proc and the fresh
- * --tmpfs /tmp.  Every unveiled path is bind/tmpfs-mounted (or the toolchain
- * ro-binds), so it exists inside the namespace — stage3's unveil() on a
- * missing path would die.  Returns a malloc'd spec, or NULL when it
- * would not fit (caller fails LOUDLY — fail closed, never truncate). */
-static char *build_landlock_spec(const char *workdir, const char *src_ro,
-                                 const char *store_root) {
+ * bind-only isolation).  The workdir is unveiled by its SHORT sandbox
+ * mountpoint "/build" (run_sandboxed binds <store_root>.build/<hash>-<name>-
+ * <pid> there): stage3 parses the spec through a fixed 256-byte buffer and
+ * dies on longer specs, and the host workdir path (store + ".build/" + 64
+ * hex chars + name + pid) alone can approach that budget.  /lib64 is
+ * included exactly when it is bind-mounted (is_dir2), so every unveiled
+ * path exists inside the sandbox — stage3's unveil() on a missing path
+ * dies.  workdir gets rwcx (builds exec ./configure and write their own
+ * artifacts, mirroring rattan's exec-workspace choice) and is the scratch
+ * dir under <store_root>.build — a SIBLING of the store, so its rwcx grant
+ * never widens the store's :r (store_root stays read-only for the recipe
+ * at BOTH fences: the bwrap ro-bind and this Landlock rule).  src_ro is rx
+ * (read + exec); store_root is r.  /dev, /proc, /tmp cover the runtime
+ * needs of the mounted dev/proc and the fresh --tmpfs /tmp.  Every unveiled
+ * path is bind/tmpfs-mounted (or the toolchain ro-binds), so it exists
+ * inside the namespace.  Returns a malloc'd spec, or NULL when it would
+ * not fit (caller fails LOUDLY — fail closed, never truncate). */
+static char *build_landlock_spec(const char *src_ro, const char *store_root) {
     char buf[512];
     size_t off = 0;
     int first = 1;
     if (spec_append(buf, sizeof buf, &off, &first, store_root, "r") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, src_ro,     "rx") != 0 ||
-        spec_append(buf, sizeof buf, &off, &first, workdir,    "rwcx") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, "/build",   "rwcx") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/usr",     "rx") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/bin",     "rx") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/lib",     "rx") != 0 ||
@@ -334,10 +352,10 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         /* ── child ── nothing below may degrade into a LESS-sandboxed exec:
          * stage3 must be reachable or we die (127) LOUDLY. */
         scrub_env();
-        char *spec = build_landlock_spec(workdir, src_ro, store_root);
+        char *spec = build_landlock_spec(src_ro, store_root);
         if (!spec) {
             fprintf(stderr, "fxstore: cannot build LANDLOCK_SPEC for this build "
-                            "(store/src/workdir paths too long)\n");
+                            "(store/src paths too long)\n");
             _exit(127);
         }
         const char *st3 = stage3_bin();
@@ -361,17 +379,38 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
                                            the caller's real uid, so workdir/
                                            store writes keep their ownership */
         PUSH("--gid"); PUSH("1000");
+        /* Fresh private /tmp, pushed BEFORE every bind.  bwrap applies mount
+         * ops in argv order: a tmpfs pushed AFTER the binds would shadow any
+         * store/src/workdir living under /tmp (the classic "Can't chdir ...
+         * No such file or directory" — the bind dest is covered by the empty
+         * tmpfs).  With tmpfs first, a later bind whose dest falls under /tmp
+         * simply gets its mountpoint auto-created inside the fresh tmpfs,
+         * while bind SOURCES are resolved in the ORIGINAL namespace (bwrap
+         * pre-opens them via its original-root proc fd), so they stay
+         * reachable either way.  The LANDLOCK_SPEC's /tmp:rwc entry unveils
+         * this tmpfs, not the host /tmp. */
+        PUSH("--tmpfs"); PUSH("/tmp");
         PUSH("--ro-bind"); PUSH(store_root); PUSH(store_root);
         PUSH("--ro-bind"); PUSH("/usr"); PUSH("/usr");
         PUSH("--ro-bind"); PUSH("/bin"); PUSH("/bin");
         PUSH("--ro-bind"); PUSH("/lib"); PUSH("/lib");
         if (is_dir2("/lib64")) { PUSH("--ro-bind"); PUSH("/lib64"); PUSH("/lib64"); }
         if (src_ro && src_ro[0]) { PUSH("--ro-bind"); PUSH(src_ro); PUSH(src_ro); }
-        PUSH("--bind"); PUSH(workdir); PUSH(workdir);
-        PUSH("--chdir"); PUSH(workdir);
+        /* workdir (under <store_root>.build) is OUTSIDE the ro-bound store:
+         * a rw bind nested under a ro bind is unconstructable in bwrap, so
+         * store.c relocates the scratch dir to a sibling of the store.  It
+         * is mounted at the SHORT, fixed sandbox path /build: recipes run
+         * relative to their cwd, the fixed path keeps the LANDLOCK_SPEC
+         * clear of stage3's 256-byte budget (the host scratch path alone —
+         * store + ".build/" + 64 hex + name + pid — can approach it), and
+         * a path outside /tmp and the store cannot be shadowed by any
+         * other mount op.  The store and src keep their HOST paths: deps
+         * are reached via FX_DEP_* store paths, and recipes reference the
+         * src tree by path. */
+        PUSH("--bind"); PUSH(workdir); PUSH("/build");
+        PUSH("--chdir"); PUSH("/build");
         PUSH("--dev"); PUSH("/dev");
         PUSH("--proc"); PUSH("/proc");
-        PUSH("--tmpfs"); PUSH("/tmp");   /* fresh /tmp in the namespace (unveiled rwc) */
         PUSH("--ro-bind"); PUSH(st3); PUSH("/init");
         PUSH("--");
         /* stage3's argv is POSITIONAL — it takes NO --promises/--landlock

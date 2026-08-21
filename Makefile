@@ -77,9 +77,16 @@ fxstore: $(FX_SRCS) fxstore.h stage3
 fxstore-golden: fxstore
 	@tests/fxstore_golden.sh ./fxstore
 
-test: fxstore-golden
+# Sandboxed-build test: exercises run_sandboxed (Shell actions under bwrap
+# + stage3) — part A verifies the bwrap argv/env construction through an
+# instrumented shim (runs everywhere); part B runs the real stack where the
+# host can nest bwrap (loud skip otherwise, e.g. inside another sandbox).
+fxstore-sandboxed: fxstore
+	@tests/fxstore_sandboxed.sh ./fxstore
+
+test: fxstore-golden fxstore-sandboxed
 
 clean:
 	rm -f fxstore fxstore.aarch64.elf fxstore.com.dbg
 
-.PHONY: all clean test fxstore-golden stage3
+.PHONY: all clean test fxstore-golden fxstore-sandboxed stage3

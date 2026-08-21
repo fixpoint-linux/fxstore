@@ -1,14 +1,18 @@
 /* store.c — (U4) content store layout + atomic install + metadata-LAST
  * txn commit + pinned-snapshot GC.
  *
- * LAYOUT: <root>/ holds content dirs "<hex64>-<name>/", a scratch dir
- * <root>/.tmp/, and the metadata DB <root>/.db (dl_open).  The DB's
- * `store(hash,name)` relation (arity 2, interned syms) is the durable
- * committed-store index.
+ * LAYOUT: <root>/ holds content dirs "<hex64>-<name>/" and the metadata DB
+ * <root>/.db (dl_open); build scratch dirs live in the SIBLING directory
+ * <root>.build/ — OUTSIDE the store, because run_sandboxed ro-binds the
+ * whole store read-only and a rw workdir nested under that ro bind cannot
+ * be mounted by bwrap.  The DB's `store(hash,name)` relation (arity 2,
+ * interned syms) is the durable committed-store index.
  *
  * BUILD ORDER (the crash-consistency invariant):
- *   1. run the recipe into <root>/.tmp/<hash>-<name>-<pid>  (NOT final)
+ *   1. run the recipe into <root>.build/<hash>-<name>-<pid>  (NOT final)
  *   2. atomically rename() the temp dir to <root>/<hash>-<name>
+ *      (same filesystem by construction: <root>.build is a sibling whose
+ *      st_dev is checked against <root>'s at store-open time)
  *   3. ONLY THEN commit the metadata txn (dl_txn_begin -> dl_txn_add_fact
  *      -> dl_txn_commit): one WAL append + one fsync is THE atomic commit
  *      point.
@@ -45,6 +49,7 @@
 
 struct FxStore {
     char root[FX_PATH_MAX];   /* no trailing '/' */
+    char build[FX_PATH_MAX];  /* <root>.build — scratch area, no trailing '/' */
     struct dl_db *db;
 };
 
@@ -116,17 +121,50 @@ FxStore *fx_store_open(const char *root, char *err, size_t errcap) {
         return NULL;
     }
 
-    char tmp[FX_PATH_MAX], dbp[FX_PATH_MAX];
-    if (snprintf(tmp, sizeof tmp, "%s/%s", s->root, FX_TMP_SUBDIR) >= (int)sizeof tmp ||
+    char dbp[FX_PATH_MAX];
+    if (snprintf(s->build, sizeof s->build, "%s%s", s->root, FX_BUILD_SUFFIX)
+            >= (int)sizeof s->build ||
         snprintf(dbp, sizeof dbp, "%s/%s", s->root, FX_DB_SUBDIR) >= (int)sizeof dbp) {
         fx_err(err, errcap, "store path too long");
         free(s);
         return NULL;
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-        fx_err(err, errcap, "cannot create '%s': %s", tmp, strerror(errno));
+    /* Build scratch area: a SIBLING of the store root, never inside it —
+       run_sandboxed ro-binds the whole store, so a rw workdir nested under
+       it could not be mounted inside the bwrap sandbox.  It must sit on the
+       SAME filesystem as the store root: the atomic install below
+       rename()s <root>.build/<hash>-<name>-<pid> into <root>/<hash>-<name>,
+       and rename(2) across filesystems fails with EXDEV.  Check the device
+       ids here and fail loudly at open time instead of mid-build (a root
+       that is itself a mount point puts the sibling on the parent fs — the
+       one layout this rejects). */
+    if (mkdir(s->build, 0755) != 0 && errno != EEXIST) {
+        fx_err(err, errcap, "cannot create build dir '%s': %s", s->build, strerror(errno));
         free(s);
         return NULL;
+    }
+    if (!is_dir(s->build)) {
+        fx_err(err, errcap, "build dir '%s' is not a directory", s->build);
+        free(s);
+        return NULL;
+    }
+    {
+        struct stat st_root, st_build;
+        if (stat(s->root, &st_root) != 0 || stat(s->build, &st_build) != 0) {
+            fx_err(err, errcap, "cannot stat store root / build dir: %s", strerror(errno));
+            free(s);
+            return NULL;
+        }
+        if (st_root.st_dev != st_build.st_dev) {
+            fx_err(err, errcap,
+                   "build dir '%s' is on a different filesystem than the store "
+                   "root '%s': the atomic install rename(2)s between them and "
+                   "cannot cross filesystems; use a store root that is a plain "
+                   "directory on the target filesystem",
+                   s->build, s->root);
+            free(s);
+            return NULL;
+        }
     }
 
     s->db = dl_open(dbp);
@@ -201,7 +239,7 @@ int fx_store_build(FxStore *s, const Package *p, const char *hash,
     base = base ? base + 1 : final_path;
 
     char tmp[FX_PATH_MAX];
-    if (snprintf(tmp, sizeof tmp, "%s/%s/%s-%ld", s->root, FX_TMP_SUBDIR,
+    if (snprintf(tmp, sizeof tmp, "%s/%s-%ld", s->build,
                  base, (long)getpid()) >= (int)sizeof tmp)
         return fx_err(err, errcap, "temp build path too long");
 
@@ -328,6 +366,32 @@ static int hex64(const char *s) {
     return 1;
 }
 
+/* Sweep ONE scratch directory for crash leftovers whose owning pid is
+   gone: the current <root>.build area plus the legacy <root>/.tmp of
+   stores built before the scratch dir moved out of the store.  Entries
+   are named <hash>-<name>-<pid>; a live pid (possibly a concurrent
+   build) is never touched — only orphaned scratch dirs.  An absent
+   directory (legacy .tmp on a fresh store) is simply nothing to do. */
+static void sweep_orphan_scratch(const char *dir) {
+    DIR *td = opendir(dir);
+    if (!td) return;
+    struct dirent *te;
+    while ((te = readdir(td)) != NULL) {
+        if (!strcmp(te->d_name, ".") || !strcmp(te->d_name, "..")) continue;
+        const char *lastdash = strrchr(te->d_name, '-');
+        if (!lastdash) continue;
+        char *end = NULL;
+        long pid = strtol(lastdash + 1, &end, 10);
+        if (!end || *end != '\0' || pid <= 0) continue;
+        if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue; /* alive/unknown */
+        char junk[FX_PATH_MAX];
+        if (snprintf(junk, sizeof junk, "%s/%s", dir, te->d_name) >= (int)sizeof junk)
+            continue;
+        rm_rf(junk);
+    }
+    closedir(td);
+}
+
 int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
     if (!s || !root_pkg) return fx_err(err, errcap, "internal: null args to fx_store_gc");
 
@@ -407,7 +471,7 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
     if (!d) { fx_err(err, errcap, "cannot read store root: %s", strerror(errno)); goto fail; }
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
-        if (e->d_name[0] == '.') continue;                 /* .tmp/.db/CURRENT */
+        if (e->d_name[0] == '.') continue;                 /* .db/CURRENT */
         size_t len = strlen(e->d_name);
         if (len < 66 || e->d_name[64] != '-' || !hex64(e->d_name)) {
             fprintf(stderr, "fxstore: gc: skipping malformed store entry '%s'\n", e->d_name);
@@ -423,32 +487,15 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
     }
     closedir(d);
 
-    /* 6. sweep .tmp crash leftovers whose owning pid is gone.
-       Entries are named <hash>-<name>-<pid>; a live pid (possibly a
-       concurrent build) is never touched — only orphaned scratch dirs. */
+    /* 6. sweep crash leftovers whose owning pid is gone: the current
+       <root>.build scratch area, plus the legacy <root>/.tmp of stores
+       built before the scratch dir moved out of the store. */
+    sweep_orphan_scratch(s->build);
     {
-        char tmppath[FX_PATH_MAX];
-        if (snprintf(tmppath, sizeof tmppath, "%s/%s", s->root, FX_TMP_SUBDIR)
-                < (int)sizeof tmppath) {
-            DIR *td = opendir(tmppath);
-            if (td) {
-                struct dirent *te;
-                while ((te = readdir(td)) != NULL) {
-                    if (!strcmp(te->d_name, ".") || !strcmp(te->d_name, "..")) continue;
-                    const char *lastdash = strrchr(te->d_name, '-');
-                    if (!lastdash) continue;
-                    char *end = NULL;
-                    long pid = strtol(lastdash + 1, &end, 10);
-                    if (!end || *end != '\0' || pid <= 0) continue;
-                    if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue; /* alive/unknown */
-                    char junk[FX_PATH_MAX];
-                    if (snprintf(junk, sizeof junk, "%s/%s", tmppath, te->d_name)
-                            >= (int)sizeof junk) continue;
-                    rm_rf(junk);
-                }
-                closedir(td);
-            }
-        }
+        char legacy[FX_PATH_MAX];
+        if (snprintf(legacy, sizeof legacy, "%s/%s", s->root, FX_TMP_SUBDIR)
+                < (int)sizeof legacy)
+            sweep_orphan_scratch(legacy);
     }
 
     printf("fxstore gc: root '%s' — %d store fact(s) and %d dir(s) removed "

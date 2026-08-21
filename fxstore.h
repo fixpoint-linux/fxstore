@@ -146,6 +146,20 @@ int fx_derivation_store_path(const Package *p, char *const *dep_paths, int ndeps
 /* The datalog DB directory inside a store (root/.db).  Metadata relations:
  * pkg(name) dep(from,to) root(name) closure(name) store(hash,name). */
 #define FX_DB_SUBDIR ".db"
+/* Build scratch area: a SIBLING directory of the store root, "<root>.build"
+ * (never inside the store).  Recipes build into
+ * "<root>.build/<hash>-<name>-<pid>" and store.c rename()s the finished dir
+ * into the store.  The scratch dir must live OUTSIDE the store root because
+ * run_sandboxed ro-binds the whole store read-only, and a rw workdir nested
+ * under that ro bind cannot be mounted (bwrap creates missing bind dests at
+ * mount time, in argv order, through the mounts already in place — a
+ * read-only parent makes that impossible).  It must also share the store
+ * root's filesystem (rename(2) is same-filesystem only); enforced by an
+ * st_dev comparison at store-open time. */
+#define FX_BUILD_SUFFIX ".build"
+/* Legacy scratch area: stores built before the scratch dir moved out of the
+ * store kept their workdirs under "<root>/.tmp".  Nothing creates it
+ * anymore; fx_store_gc still sweeps it so old orphaned workdirs are reaped. */
 #define FX_TMP_SUBDIR ".tmp"
 
 /* The closure program (engine syntax, cf. tests/test_m4.c transitive
@@ -182,8 +196,10 @@ int fx_topo_order(const PackageSet *ps, char **names, int n,
 
 typedef struct FxStore FxStore;
 
-/* Open (create if needed) a store at `root`: root/, root/.tmp/, and the
- * metadata DB at root/.db (dl_open).  NULL on error (err set). */
+/* Open (create if needed) a store at `root`: root/, the build scratch dir
+ * <root>.build/ (a sibling on the SAME filesystem — the atomic install
+ * rename(2)s between them and cannot cross filesystems), and the metadata
+ * DB at root/.db (dl_open).  NULL on error (err set). */
 FxStore *fx_store_open(const char *root, char *err, size_t errcap);
 
 void fx_store_close(FxStore *s);            /* NULL-safe; closes the DB */
@@ -196,7 +212,8 @@ int fx_store_publish(FxStore *s, char *err, size_t errcap);
 
 /* Build ONE package into the store (deps are already built; their store
  * paths are dep_paths, parallel to dep_names):
- *   1. run the recipe into root/.tmp/<hash>-<name>-<pid>   (U5 executor)
+ *   1. run the recipe into <root>.build/<hash>-<name>-<pid>  (U5 executor;
+ *      the scratch dir is a SIBLING of the store, never inside it)
  *   2. atomically rename() the temp dir to final_path
  *   3. ONLY THEN commit the metadata txn: store(hash,name) — one WAL +
  *      fsync is the atomic commit point.  A crash before (3) leaves a
@@ -230,21 +247,33 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap);
 void fx_stage3_resolve(void);
 void fx_bwrap_resolve(void);
 
-/* Execute the package's recipe inside `workdir` (the temp build dir):
+/* Execute the package's recipe inside `workdir` (the temp build dir under
+ * <store_root>.build, a SIBLING of the store — never inside it):
  * relative paths resolve against workdir; deps are exported as
  * FX_DEP_<NAME> environment variables (NAME uppercased, non-alnum -> '_');
  * the two EXECUTING actions (Shell, Run) run under
  *   bwrap --unshare-all --die-with-parent --uid 1000 --gid 1000
+ *        --tmpfs /tmp                    (FIRST mount op: bwrap applies
+ *         mounts in argv order, so a tmpfs pushed after the binds would
+ *         shadow any store/src/workdir placed under /tmp; bind SOURCES
+ *         resolve in the original namespace, so tmpfs-first is safe)
  *        --ro-bind <store_root> <store_root>
  *        --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib
  *        [--ro-bind /lib64 /lib64] [--ro-bind <src> <src>]
- *        --bind <workdir> <workdir> --chdir <workdir>
+ *        --bind <workdir> /build --chdir /build
  *        --dev /dev --proc /proc
  *        --ro-bind <stage3> /init
  *        -- /init <PROMISES> <LANDLOCK_SPEC> -- <argv | /bin/sh -c cmd>
  * where stage3 (palisade, vendor/palisade) applies no_new_privs ->
  * Landlock (unveil of exactly the bind-mounted paths — never "/") ->
- * rlimits -> seccomp before exec'ing the recipe command.  RATTAN_ and LD_
+ * rlimits -> seccomp before exec'ing the recipe command.  The workdir
+ * (<store_root>.build/<hash>-<name>-<pid>, a SIBLING of the store) is rw-
+ * bound at the SHORT fixed path /build — outside the ro-bound store (a rw
+ * mount nested under a ro bind cannot be constructed by bwrap: it would
+ * have to create the nested mountpoint through the read-only bind) and
+ * short enough to keep the LANDLOCK_SPEC inside stage3's 256-byte budget.
+ * The store and src stay at their HOST paths (deps are reached via
+ * FX_DEP_* store paths).  RATTAN_ and LD_
  * env vars are scrubbed from the child first (stage3 reads
  * RATTAN_ALLOW_PTRACE/RATTAN_EXTRA_PROMISES/RATTAN_RLIMITS; LD_PRELOAD
  * injects into the exec chain).  stage3-absent fails LOUDLY (127); if

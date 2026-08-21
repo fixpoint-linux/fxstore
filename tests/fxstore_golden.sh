@@ -37,7 +37,7 @@ for name in lib app; do
 done
 ok "build emits <64hex>-<name> store paths for lib + app"
 
-# --- the content store dirs exist and hold the recipe output ---
+# --- content store dirs exist and hold the recipe output ---
 LIBDIR="$(find "$STORE" -maxdepth 1 -type d -name '*-lib' | head -n1)"
 APPDIR="$(find "$STORE" -maxdepth 1 -type d -name '*-app' | head -n1)"
 [ -n "$LIBDIR" ] || fail "lib store dir missing"
@@ -45,6 +45,16 @@ APPDIR="$(find "$STORE" -maxdepth 1 -type d -name '*-app' | head -n1)"
 [ -f "$LIBDIR/lib.txt" ] || fail "lib recipe did not produce lib.txt"
 [ -f "$APPDIR/app.txt" ] || fail "app recipe did not produce app.txt"
 ok "content store dirs created and hold recipe output"
+
+# --- build scratch area is a SIBLING of the store, emptied on success ---
+# (the scratch dir must live outside the store: run_sandboxed ro-binds the
+# whole store, and a rw workdir nested under that ro bind is unmountable)
+[ -d "$STORE.build" ] || fail "build scratch dir '$STORE.build' missing"
+[ ! -e "$STORE/.tmp" ] || fail "legacy scratch '$STORE/.tmp' was created"
+if [ -n "$(ls -A "$STORE.build")" ]; then
+    fail "build scratch dir not emptied after successful builds: $(ls -A "$STORE.build")"
+fi
+ok "build scratch lives in '$STORE.build' (outside the store), empty after build"
 
 # --- query returns the closure + the root's store path ---
 QOUT="$(cd "$PROJ" && "$FX" query app --store "$STORE")"
