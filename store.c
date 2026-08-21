@@ -599,15 +599,21 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap) {
             fprintf(stderr, "fxstore: gc: skipping malformed store entry '%s'\n", e->d_name);
             continue;
         }
-        /* the base package name: for a clean-source dir "<64hex>-<NAME>-src"
-           strip the trailing "-src"; a built dir "<64hex>-<NAME>" uses NAME */
+        /* liveness: check the FULL name first (a built dir "<64hex>-<NAME>"
+           where NAME itself ends in "-src"), then the "-src"-stripped base
+           (a clean-source dir "<64hex>-<NAME>-src").  Keep the dir if EITHER
+           is live — GC must never delete a live package's dir and leave
+           dangling store metadata (package names are arbitrary Text). */
         char name[FX_PATH_MAX];
         size_t nl = len - 65;                /* NAME + optional -src */
-        if (nl > 4 && !strcmp(e->d_name + len - 4, "-src")) nl -= 4;
         if (nl >= sizeof name) continue;
         memcpy(name, e->d_name + 65, nl);
         name[nl] = '\0';
         if (in_set(live, nlive, name)) continue;
+        if (nl > 4 && !strcmp(name + nl - 4, "-src")) {
+            name[nl - 4] = '\0';
+            if (in_set(live, nlive, name)) continue;
+        }
         char path[FX_PATH_MAX];
         if (snprintf(path, sizeof path, "%s/%s", s->root, e->d_name) >= (int)sizeof path)
             continue;

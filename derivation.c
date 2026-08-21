@@ -101,7 +101,7 @@ static int buf_str(Buf *b, const char *s, char *err, size_t errcap) {
  * trees; see handoff-fxstore-cleansrc-artifact-1):
  *   DIRS (basename match, any depth): .git .cache build build-tmp
  *       __pycache__ .py-site pydl  — plus the dl-test-* test-dir prefix
- *   FILES (suffix): .o .a .so .com .dbg .elf
+ *   FILES (suffix): .o .a .so .com .dbg .elf .wasm
  *   FILES (prefix): .ape-
  * `.git` matches BOTH a top-level .git directory AND a submodule gitfile
  * (basename `.git`, regardless of file/dir).  Excluded entries are SILENT
@@ -119,7 +119,7 @@ static int fx_clean_excluded(const char *basename, int is_dir) {
         if (!strncmp(basename, "dl-test-", 8)) return 1;
     } else {
         static const char *const exts[] = {
-            ".o", ".a", ".so", ".com", ".dbg", ".elf"
+            ".o", ".a", ".so", ".com", ".dbg", ".elf", ".wasm"
         };
         size_t bl = strlen(basename);
         for (size_t i = 0; i < sizeof exts / sizeof exts[0]; i++) {

@@ -118,7 +118,7 @@ void fx_packageset_free(PackageSet *ps);
  * in the same single walk.  The tree is CLEANED before hashing/copying by an
  * exclusion table (see fx_clean_tree's comment in derivation.c — the
  * AUTHORITATIVE spec): git state (.git, dir or submodule gitfile), committed
- * build binaries (.o .a .so .com .dbg .elf, .ape- prefix), and caches/build
+ * build binaries (.o .a .so .com .dbg .elf .wasm, .ape- prefix), and caches/build
  * dirs (.cache build build-tmp __pycache__ .py-site pydl dl-test-*) are
  * SILENTLY SKIPPED, so the store path is a pure function of SOURCE content,
  * independent of checkout state.  Excluded entries are silent skips, not
