@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* ─── Growable byte buffer ─────────────────────────────────────────────── */
 
@@ -168,8 +169,27 @@ int fx_content_hash_dir(const char *dir, char hash_out[65], char *err, size_t er
         } else if (S_ISREG(st.st_mode)) {
             ents[n].type = 'f';
             if (sha256_file(child, ents[n].hash, err, errcap) != 0) { free(child); goto out; }
+        } else if (S_ISLNK(st.st_mode)) {
+            /* A symlink is content: its TARGET (readlink bytes) is hashed,
+             * type 'l'.  This keeps the store path a function of the actual
+             * tree content — a symlink retarget changes the hash — while
+             * accepting trees that legitimately contain symlinks (e.g. the
+             * vendored ggml in datalog-dafsa).  The workdir copy (cp -a) and
+             * the sandbox ro-bind both preserve symlinks, so the recipe can
+             * follow them; a broken symlink (readlink succeeds, target
+             * missing) is still hashed and copied faithfully. */
+            char target[PATH_MAX];
+            ssize_t tl = readlink(child, target, sizeof target - 1);
+            if (tl < 0) {
+                fx_err(err, errcap, "readlink '%s': %s", child, strerror(errno));
+                free(child);
+                goto out;
+            }
+            target[tl] = '\0';
+            sha256_hex((const unsigned char *)target, (size_t)tl, ents[n].hash);
+            ents[n].type = 'l';
         } else {
-            fx_err(err, errcap, "unsupported non-regular source entry '%s' (symlink/special)", child);
+            fx_err(err, errcap, "unsupported special source entry '%s'", child);
             free(child);
             goto out;
         }

@@ -84,9 +84,16 @@ fxstore-golden: fxstore
 fxstore-sandboxed: fxstore
 	@tests/fxstore_sandboxed.sh ./fxstore
 
-test: fxstore-golden fxstore-sandboxed
+# M3 self-hosting test: builds the two leaf packages (dafsa, dhall-c) from
+# fxstore/m3/package-set.dhall into a temp store under the real bwrap + stage3
+# sandbox.  Loudly skips on hosts without bwrap (mirrors fxstore-sandboxed
+# part B); does not falsely pass.
+fxstore-m3: fxstore
+	@tests/fxstore_m3.sh ./fxstore
+
+test: fxstore-golden fxstore-sandboxed fxstore-m3
 
 clean:
 	rm -f fxstore fxstore.aarch64.elf fxstore.com.dbg
 
-.PHONY: all clean test fxstore-golden fxstore-sandboxed stage3
+.PHONY: all clean test fxstore-golden fxstore-sandboxed fxstore-m3 stage3
