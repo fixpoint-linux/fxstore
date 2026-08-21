@@ -32,7 +32,7 @@ See the [fixpoint-linux design](https://github.com/fixpoint-linux/fixpoint-linux
 
 ## Dependencies
 
-Two sibling repos, referenced by path (mirroring `datalog-dafsa`'s `dlp` tool):
+Two git submodules (under `vendor/`), initialized via `git submodule update --init --recursive`:
 
 - [`datalog-dafsa`](https://github.com/fixpoint-linux/datalog-dafsa) — the engine + vendored dafsa
 - [`dhall-c`](https://github.com/fixpoint-linux/dhall-c) — the Dhall interpreter core

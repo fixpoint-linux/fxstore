@@ -2,18 +2,19 @@
 #
 # Builds the fxstore CLI (fxstore) from:
 #   - this repo's source: fxstore/{main,packageset,derivation,closure,store,build}.c
-#   - the datalog-dafsa engine + vendored dafsa (dependency repo, sibling dir)
-#   - the dhall-c interpreter core (dependency repo, sibling dir)
+#   - the datalog-dafsa engine + vendored dafsa (git submodule, vendor/datalog-dafsa)
+#   - the dhall-c interpreter core (git submodule, vendor/dhall-c)
 #
-# Both dependencies are referenced by sibling path, mirroring datalog-dafsa's
-# own dlp tool.  Override with:
+# Initialize the submodules first:
+#     git submodule update --init --recursive
+#
+# Override the dependency paths with:
 #     make DATALOG=/path/to/datalog-dafsa DHALLC=/path/to/dhall-c
 #
-# Requires the cosmocc toolchain (Cosmopolitan).  Default `make`/`make test`
-# of the dependency repos are untouched; this is opt-in.
+# Requires the cosmocc toolchain (Cosmopolitan).
 
-DATALOG ?= $(CURDIR)/../datalog-dafsa
-DHALLC  ?= $(CURDIR)/../dhall-c
+DATALOG ?= $(CURDIR)/vendor/datalog-dafsa
+DHALLC  ?= $(CURDIR)/vendor/dhall-c
 
 # dhall-c interpreter core sources (link directly, in dhall-c's own order;
 # exclude its entry-point/extra TUs: main/wasm/bench/lsp and json.c which only
