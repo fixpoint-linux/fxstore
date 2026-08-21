@@ -243,15 +243,46 @@ APPDIR2="$(find "$STORE2" -maxdepth 1 -type d -name '*-shapp' | head -n1)"
 [ -n "$APPDIR2" ] || fail "shapp store dir missing (part B)"
 [ "$(cat "$APPDIR2/shell.txt")" = "hi" ] || fail "real-stack Shell action did not produce shell.txt"
 [ ! -e "$APPDIR2/pwned-marker" ] || fail "PATH hijack succeeded under the real stack"
-# Landlock fence: /etc is not unveiled, so reading a host file through the
-# (visible but fenced) namespace root must be denied.
-if [ -s "$APPDIR2/hostname-leak.txt" ] \
-   && ! grep -qiE 'denied|not permitted|no such file' "$APPDIR2/hostname-leak.txt"; then
-    fail "Landlock fence broken: recipe read a host file outside the unveil set: $(head -c 120 "$APPDIR2/hostname-leak.txt")"
-fi
+
+# FENCE PROBES (store integrity + Landlock-only write denial). These run only
+# here, under the REAL stack — under the part-A shim there is no fence, so they
+# get their own project/store and must never run in part A.
+PROJ3="$WORK/proj3"
+STORE3="$WORK/store3"
+mkdir -p "$PROJ3/src/shlib" "$PROJ3/src/shapp"
+echo "lib source" > "$PROJ3/src/shlib/s.txt"
+echo "app source" > "$PROJ3/src/shapp/s.txt"
+cat > "$PROJ3/package-set.dhall" <<'EOF'
+let Action = < Shell : Text | Copy : { from : Text, to : Text } | Mkdir : Text | Rm : Text | Touch : Text | Move : { from : Text, to : Text } | Symlink : { from : Text, to : Text } | Chmod : { path : Text, mode : Text } | Echo : Text | Env : { key : Text, value : Text } | Run : { argv : List Text } >
+let Src = < Path : Text | Fetch : { url : Text, hash : Text } >
+let Build = { target : Text, recipe : List Action }
+let Package = { name : Text, version : Text, src : Src, deps : List Text, build : Build }
+let PackageSet = { packages : List Package }
+in { packages =
+     [ { name = "shlib", version = "1.0.0", src = < Path = "src/shlib" >, deps = [] : List Text,
+         build = { target = "shlib", recipe = [ < Touch = "dep.txt" > ] } },
+       { name = "shapp", version = "1.0.0", src = < Path = "src/shapp" >, deps = [ "shlib" ],
+         build = { target = "shapp",
+                   recipe = [ < Shell = "echo x > $FX_DEP_SHLIB/pwn 2> fence-store.txt || echo DENIED >> fence-store.txt" >,
+                              < Shell = "echo 1 > /proc/self/oom_score_adj 2> fence-proc.txt || echo DENIED >> fence-proc.txt" > ] } } ] } : PackageSet
+EOF
+(cd "$PROJ3" && "$FX" build --store "$STORE3" shapp) > "$WORK/build3.out" 2>&1 \
+    || fail "fence-probe build failed: $(cat "$WORK/build3.out")"
+APPDIR3="$(find "$STORE3" -maxdepth 1 -type d -name '*-shapp' | head -n1)"
+SHLIBDIR3="$(find "$STORE3" -maxdepth 1 -type d -name '*-shlib' | head -n1)"
+[ -n "$APPDIR3" ] && [ -n "$SHLIBDIR3" ] || fail "fence-probe store dirs missing"
+# (a) store integrity: writing the ro-bound dep store dir must be DENIED
+#     (belt: bwrap ro-bind EROFS; braces: Landlock store :r)
+grep -q DENIED "$APPDIR3/fence-store.txt" || fail "store write NOT denied (ro fence broken)"
+[ ! -e "$SHLIBDIR3/pwn" ] || fail "store write fence broken: pwn file created in dep store dir"
+# (b) Landlock-ONLY denial: /proc is mounted rw (--proc) but unveiled :r, and
+#     /proc/self/oom_score_adj is DAC-writable by the process itself — ONLY
+#     Landlock denies this write. If it succeeds, Landlock is not enforcing.
+grep -q DENIED "$APPDIR3/fence-proc.txt" || fail "Landlock fence broken: /proc write (spec :r) succeeded"
+
 if [ -n "$(ls -A "$STORE2.build")" ]; then
     fail "scratch area not emptied after real-stack build"
 fi
-ok "real bwrap + stage3 stack builds Shell actions; Landlock fence holds"
+ok "real bwrap + stage3 stack builds Shell actions; store-write + Landlock fences hold"
 
 echo "ALL FXSTORE SANDBOXED TESTS PASSED"
