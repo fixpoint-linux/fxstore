@@ -46,6 +46,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -205,6 +206,32 @@ static const char *stage3_bin(void) {
     return g_stage3_path;
 }
 
+/* Resolved absolute bwrap path (NULL when not resolvable at startup).
+ * Looked up ONCE, before any recipe Env action runs: execvp("bwrap")
+ * searches the CURRENT PATH, which recipes control — a recipe could plant
+ * a fake `bwrap` in /tmp (unveiled rwc) or the workdir (rwcx) and redirect
+ * PATH to it, substituting the sandbox layer itself. The child execs this
+ * ABSOLUTE path (no PATH search); NULL means take the LOUD fallback branch
+ * directly. */
+static char *g_bwrap_path;
+
+void fx_bwrap_resolve(void) {
+    if (g_bwrap_path) return;
+    const char *path = getenv("PATH");
+    char *dup = path ? strdup(path) : NULL;
+    if (dup) {
+        for (char *tok = strtok(dup, ":"); tok; tok = strtok(NULL, ":")) {
+            char cand[PATH_MAX];
+            if (*tok && snprintf(cand, sizeof cand, "%s/bwrap", tok) < (int)sizeof cand
+                && access(cand, X_OK) == 0) {
+                g_bwrap_path = strdup(cand);
+                break;
+            }
+        }
+        free(dup);
+    }
+}
+
 /* Drop every RATTAN_* and LD_* variable from the (fork'd child's)
  * environment before exec.  stage3 reads RATTAN_ALLOW_PTRACE=1 as "skip
  * seccomp entirely" and RATTAN_EXTRA_PROMISES/RATTAN_RLIMITS as config;
@@ -247,9 +274,10 @@ static int spec_append(char *buf, size_t cap, size_t *off, int *first,
                        const char *path, const char *perms) {
     if (!path || !path[0]) return 0;
     size_t l = strlen(path), pl = strlen(perms), sep = *first ? 0 : 1;
-    if (*off + l + pl + sep + 1 > cap) return -1;
+    if (*off + l + 1 + pl + sep + 1 > cap) return -1;   /* +1 for the ':' */
     if (sep) buf[(*off)++] = ';';
     memcpy(buf + *off, path, l); *off += l;
+    buf[(*off)++] = ':';
     memcpy(buf + *off, perms, pl); *off += pl;
     buf[*off] = '\0';
     *first = 0;
@@ -264,9 +292,11 @@ static int spec_append(char *buf, size_t cap, size_t *off, int *first,
  * mounted (is_dir2), so every unveiled path exists inside the sandbox —
  * stage3's unveil() on a missing path dies.  workdir gets rwcx (builds exec
  * ./configure and write their own artifacts, mirroring rattan's exec-
- * workspace choice); src_ro is rx (read + exec); store_root is r.  /etc,
- * /dev, /proc, /tmp cover the runtime needs of the mounted dev/proc and the
- * host-visible /etc and /tmp.  Returns a malloc'd spec, or NULL when it
+ * workspace choice); src_ro is rx (read + exec); store_root is r.  /dev,
+ * /proc, /tmp cover the runtime needs of the mounted dev/proc and the fresh
+ * --tmpfs /tmp.  Every unveiled path is bind/tmpfs-mounted (or the toolchain
+ * ro-binds), so it exists inside the namespace — stage3's unveil() on a
+ * missing path would die.  Returns a malloc'd spec, or NULL when it
  * would not fit (caller fails LOUDLY — fail closed, never truncate). */
 static char *build_landlock_spec(const char *workdir, const char *src_ro,
                                  const char *store_root) {
@@ -281,7 +311,6 @@ static char *build_landlock_spec(const char *workdir, const char *src_ro,
         spec_append(buf, sizeof buf, &off, &first, "/lib",     "rx") != 0 ||
         (is_dir2("/lib64") &&
          spec_append(buf, sizeof buf, &off, &first, "/lib64", "rx") != 0) ||
-        spec_append(buf, sizeof buf, &off, &first, "/etc",     "r") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/dev",     "rwc") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/proc",    "r") != 0 ||
         spec_append(buf, sizeof buf, &off, &first, "/tmp",     "rwc") != 0)
@@ -342,6 +371,7 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         PUSH("--chdir"); PUSH(workdir);
         PUSH("--dev"); PUSH("/dev");
         PUSH("--proc"); PUSH("/proc");
+        PUSH("--tmpfs"); PUSH("/tmp");   /* fresh /tmp in the namespace (unveiled rwc) */
         PUSH("--ro-bind"); PUSH(st3); PUSH("/init");
         PUSH("--");
         /* stage3's argv is POSITIONAL — it takes NO --promises/--landlock
@@ -358,11 +388,9 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         #undef PUSH
         if (oom) { fprintf(stderr, "fxstore: out of memory building bwrap argv\n"); _exit(127); }
 
-        execvp("bwrap", av);
-        if (errno == ENOENT) {
-            /* LOUD, never-silent non-hermetic fallback — ONLY for a missing
-             * bwrap.  (A missing stage3 already died above; env is scrubbed
-             * here too, so not even the fallback leaks RATTAN_/LD_ vars.) */
+        if (!g_bwrap_path) {
+            /* bwrap was not resolvable at startup: LOUD fallback directly —
+             * never execvp("bwrap"), whose PATH lookup recipes control. */
             fprintf(stderr,
                 "\n*** fxstore: WARNING: bwrap not found — running NON-HERMETIC "
                 "(unsandboxed): %s ***\n\n", real_argv[0]);
@@ -375,6 +403,8 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
             fprintf(stderr, "fxstore: exec '%s' failed: %s\n", real_argv[0], strerror(errno));
             _exit(127);
         }
+        av[0] = g_bwrap_path;              /* argv[0] = the real binary */
+        execvp(g_bwrap_path, av);          /* absolute path: no PATH search */
         fprintf(stderr, "fxstore: bwrap exec failed: %s\n", strerror(errno));
         _exit(127);
     }

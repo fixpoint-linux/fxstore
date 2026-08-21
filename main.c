@@ -469,6 +469,7 @@ int main(int argc, char **argv) {
      * is loaded — recipes can set arbitrary env vars via the Env action,
      * and the FXSTORE_STAGE3 override must be settled before they run. */
     fx_stage3_resolve();
+    fx_bwrap_resolve();      /* lock the bwrap path before recipes run */
 
     if (!cmd || !strcmp(cmd, "-h") || !strcmp(cmd, "--help")) {
         usage(cmd ? stdout : stderr);

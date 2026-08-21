@@ -228,6 +228,7 @@ int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap);
  * before loading any package set: recipes can set arbitrary env vars via
  * the Env action, and this must already be settled when they run. */
 void fx_stage3_resolve(void);
+void fx_bwrap_resolve(void);
 
 /* Execute the package's recipe inside `workdir` (the temp build dir):
  * relative paths resolve against workdir; deps are exported as
