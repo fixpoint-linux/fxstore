@@ -4,17 +4,20 @@
 #   - this repo's source: fxstore/{main,packageset,derivation,closure,store,build}.c
 #   - the datalog-dafsa engine + vendored dafsa (git submodule, vendor/datalog-dafsa)
 #   - the dhall-c interpreter core (git submodule, vendor/dhall-c)
+#   - the palisade stage3 sandbox inner binary (git submodule, vendor/palisade;
+#     the seccomp/Landlock hardening layer Shell/Run actions run under)
 #
 # Initialize the submodules first:
 #     git submodule update --init --recursive
 #
 # Override the dependency paths with:
-#     make DATALOG=/path/to/datalog-dafsa DHALLC=/path/to/dhall-c
+#     make DATALOG=/path/to/datalog-dafsa DHALLC=/path/to/dhall-c PALISADE=/path/to/palisade
 #
 # Requires the cosmocc toolchain (Cosmopolitan).
 
 DATALOG ?= $(CURDIR)/vendor/datalog-dafsa
 DHALLC  ?= $(CURDIR)/vendor/dhall-c
+PALISADE ?= $(CURDIR)/vendor/palisade
 
 # dhall-c interpreter core sources (link directly, in dhall-c's own order;
 # exclude its entry-point/extra TUs: main/wasm/bench/lsp and json.c which only
@@ -54,10 +57,21 @@ COSMOCC := cosmocc
 CFLAGS = -std=c11 -O2 -g -Wall -Wextra \
          -I$(DHALLC)/src -I$(DATALOG)/vendor -I$(DATALOG)/src
 
+# Bake the stage3 path into fxstore: run_sandboxed() binds this binary as
+# /init inside the bwrap sandbox and execs it before the recipe's command
+# (stage3 applies no_new_privs -> Landlock -> rlimits -> seccomp).
+# Overridable at runtime with the FXSTORE_STAGE3 environment variable.
+FXSTORE_STAGE3_PATH = $(PALISADE)/bin/stage3
+
 all: fxstore
 
-fxstore: $(FX_SRCS) fxstore.h
-	$(COSMOCC) $(CFLAGS) -o fxstore $(FX_SRCS) $(ENGINE_SRCS) $(CORE_SRCS)
+# The palisade stage3 inner sandbox binary (seccomp/Landlock layer).
+stage3:
+	$(MAKE) -C $(PALISADE) stage3
+
+fxstore: $(FX_SRCS) fxstore.h stage3
+	$(COSMOCC) $(CFLAGS) -DFXSTORE_STAGE3_PATH='"$(FXSTORE_STAGE3_PATH)"' \
+	    -o fxstore $(FX_SRCS) $(ENGINE_SRCS) $(CORE_SRCS)
 
 # Golden end-to-end test: scaffold, build, query, gc into a temp store.
 fxstore-golden: fxstore
@@ -68,4 +82,4 @@ test: fxstore-golden
 clean:
 	rm -f fxstore fxstore.aarch64.elf fxstore.com.dbg
 
-.PHONY: all clean test fxstore-golden
+.PHONY: all clean test fxstore-golden stage3

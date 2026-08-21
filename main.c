@@ -465,6 +465,11 @@ static int cmd_init(char **argv, int argc, int start) {
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : NULL;
 
+    /* Resolve the stage3 sandbox binary path ONCE, before any package-set
+     * is loaded — recipes can set arbitrary env vars via the Env action,
+     * and the FXSTORE_STAGE3 override must be settled before they run. */
+    fx_stage3_resolve();
+
     if (!cmd || !strcmp(cmd, "-h") || !strcmp(cmd, "--help")) {
         usage(cmd ? stdout : stderr);
         return cmd ? 0 : 2;

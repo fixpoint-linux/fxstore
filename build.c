@@ -1,4 +1,4 @@
-/* build.c — (U5) recipe executor + bwrap sandbox.
+/* build.c — (U5) recipe executor + bwrap/palisade stage3 sandbox.
  *
  * run_action/print_action are PORTED from dhake/src/dhake.c (453-557 /
  * 560-579) with the two fxstore changes from the plan (Decision 6):
@@ -6,12 +6,32 @@
  *       dir (workdir — the dir that becomes the store path); each direct
  *       dep's store path is exported as FX_DEP_<NAME> (read-only content:
  *       deps were built before this package and are content-addressed);
- *   (b) the two EXECUTING actions (Shell, Run) run under a bwrap sandbox:
- *       unshare-all (network OFF), die-with-parent, the store and the
- *       toolchain dirs read-only, the workdir writable, /dev + /proc
- *       mounted.  The pure-filesystem actions (Copy/Mkdir/Rm/Touch/Move/
- *       Symlink/Chmod/Echo/Env) are trusted declarative ops and run
- *       in-process without a sandbox.
+ *   (b) the two EXECUTING actions (Shell, Run) run under a bwrap sandbox
+ *       with the palisade stage3 inner binary (vendor/palisade) as /init:
+ *         bwrap --unshare-all --die-with-parent --uid 1000 --gid 1000
+ *               [binds: ro-bind store, /usr /bin /lib [/lib64], ro-bind src,
+ *                bind workdir, --dev /dev, --proc /proc, ro-bind stage3 /init]
+ *               -- /init <PROMISES> <LANDLOCK_SPEC> -- <real_argv...>
+ *       stage3 (applied no_new_privs -> Landlock -> rlimits -> seccomp, in
+ *       that order) hardens the bwrap namespaces: the recipe's syscalls are
+ *       whitelist-filtered (pledge) and the filesystem is unveil()ed down
+ *       to exactly the bind-mounted paths (Landlock).  The
+ *       pure-filesystem actions (Copy/Mkdir/Rm/Touch/Move/Symlink/Chmod/
+ *       Echo/Env) are trusted declarative ops and run in-process without
+ *       a sandbox.
+ *     SECURITY invariants of this executor:
+ *       - RATTAN_ and LD_ variables are scrubbed from the child environment
+ *         before exec: stage3 reads RATTAN_ALLOW_PTRACE (which skips seccomp
+ *         entirely) plus RATTAN_EXTRA_PROMISES/RATTAN_RLIMITS from the
+ *         environment, and LD_PRELOAD/LD_* would inject into the exec'd
+ *         chain — a recipe's Env action must not be able to reach any of
+ *         them.
+ *       - The LANDLOCK_SPEC unveils ONLY the bind-mounted paths, never
+ *         "/:r" — unlike rattan, fxstore's bwrap keeps the HOST / as the
+ *         sandbox root, so "/:r" would expose the whole host fs.
+ *       - stage3-absent is a LOUD failure (exit 127), never a fallback;
+ *         the LOUD NON-HERMETIC fallback below is reserved for the
+ *         bwrap-absent case only.
  *     If bwrap is absent the child prints a LOUD NON-HERMETIC warning and
  *     falls back to plain fork/exec in the workdir — never a silent
  *     fallback.
@@ -148,8 +168,132 @@ static int argv_push(char ***av, int *n, int *cap, const char *s) {
     return 0;
 }
 
-/* fork + exec real_argv under bwrap; on ENOENT fall back LOUDLY to plain
- * exec in the workdir.  Returns the child's exit code (2 if signaled). */
+/* ─── stage3 (palisade) inner sandbox binary ──────────────────────────── */
+
+/* Pledge promise set for build recipes: rattan's agent baseline (stdio
+ * rpath wpath cpath flock exec prot_exec proc recvfd) plus dpath (rm -rf /
+ * rmdir in recipes, make clean) and fattr (chmod/utimes — assimilate and
+ * make artifact stamping).  NO inet/dns/tty: builds run network-off.
+ * prot_exec is required for dynamically-linked binaries to map their
+ * libraries at all. */
+#define FXSTORE_PROMISES \
+    "stdio rpath wpath cpath dpath flock fattr exec prot_exec proc recvfd"
+
+#ifndef FXSTORE_STAGE3_PATH
+#define FXSTORE_STAGE3_PATH "vendor/palisade/bin/stage3"
+#endif
+
+/* Resolved stage3 path: the FXSTORE_STAGE3 environment override if it was
+ * set when fxstore started, else the compile-time FXSTORE_STAGE3_PATH (the
+ * Makefile bakes the vendor/palisade submodule's bin/stage3 here).
+ * Resolved EXACTLY ONCE (first call wins); fx_stage3_resolve() is called
+ * from main() before any package-set is loaded, because a recipe's Env
+ * action can set arbitrary environment variables — reading the override
+ * lazily would let a recipe point the sandbox's inner binary at its own
+ * code for a later action or package (shedding the stage3 layer while
+ * keeping the weaker bwrap-only isolation). */
+static const char *g_stage3_path;
+
+void fx_stage3_resolve(void) {
+    if (g_stage3_path) return;
+    const char *p = getenv("FXSTORE_STAGE3");
+    g_stage3_path = (p && *p) ? p : FXSTORE_STAGE3_PATH;
+}
+
+static const char *stage3_bin(void) {
+    if (!g_stage3_path) fx_stage3_resolve();
+    return g_stage3_path;
+}
+
+/* Drop every RATTAN_* and LD_* variable from the (fork'd child's)
+ * environment before exec.  stage3 reads RATTAN_ALLOW_PTRACE=1 as "skip
+ * seccomp entirely" and RATTAN_EXTRA_PROMISES/RATTAN_RLIMITS as config;
+ * LD_PRELOAD and friends inject into every exec'd binary.  A recipe's Env
+ * action (or the invoking shell) must not be able to reach any of them.
+ * Same collect-then-unset pattern as set_dep_env: unsetenv mutates
+ * environ, so the scan must finish before the first unsetenv. */
+static void scrub_env(void) {
+    char **drop = NULL;
+    int nd = 0, cap = 0;
+    for (char **e = environ; e && *e; e++) {
+        if (strncmp(*e, "RATTAN_", 7) != 0 && strncmp(*e, "LD_", 3) != 0)
+            continue;
+        size_t len = strchr(*e, '=') ? (size_t)(strchr(*e, '=') - *e) : strlen(*e);
+        char *name = malloc(len + 1);
+        if (!name) continue;
+        memcpy(name, *e, len);
+        name[len] = '\0';
+        if (nd == cap) {
+            cap = cap ? cap * 2 : 8;
+            char **t = realloc(drop, (size_t)cap * sizeof *t);
+            if (!t) { free(name); continue; }
+            drop = t;
+        }
+        drop[nd++] = name;
+    }
+    for (int i = 0; i < nd; i++) { unsetenv(drop[i]); free(drop[i]); }
+    free(drop);
+}
+
+/* stage3 parses LANDLOCK_SPEC through a fixed 256-byte buffer and dies on
+ * anything longer; use the same limit here so an oversized spec fails with
+ * OUR message instead of stage3's. */
+#define FX_LANDLOCK_SPEC_MAX 256
+
+/* Append "path:perms" (with a ';' separator) to buf at *off.  Returns 0 on
+ * success, -1 when it would not fit in cap (path NULL/"" is a skip, not an
+ * error — SRC_FETCH packages have no src tree). */
+static int spec_append(char *buf, size_t cap, size_t *off, int *first,
+                       const char *path, const char *perms) {
+    if (!path || !path[0]) return 0;
+    size_t l = strlen(path), pl = strlen(perms), sep = *first ? 0 : 1;
+    if (*off + l + pl + sep + 1 > cap) return -1;
+    if (sep) buf[(*off)++] = ';';
+    memcpy(buf + *off, path, l); *off += l;
+    memcpy(buf + *off, perms, pl); *off += pl;
+    buf[*off] = '\0';
+    *first = 0;
+    return 0;
+}
+
+/* Build the LANDLOCK_SPEC "path:perms;path:perms;..." unveiled for this
+ * invocation.  SECURITY: unveils ONLY the bind-mounted paths — never "/:r"
+ * (fxstore's bwrap keeps the HOST / as the sandbox root; "/:r" would grant
+ * recipes read access to the entire host filesystem — a regression vs the
+ * bind-only isolation).  /lib64 is included exactly when it is bind-
+ * mounted (is_dir2), so every unveiled path exists inside the sandbox —
+ * stage3's unveil() on a missing path dies.  workdir gets rwcx (builds exec
+ * ./configure and write their own artifacts, mirroring rattan's exec-
+ * workspace choice); src_ro is rx (read + exec); store_root is r.  /etc,
+ * /dev, /proc, /tmp cover the runtime needs of the mounted dev/proc and the
+ * host-visible /etc and /tmp.  Returns a malloc'd spec, or NULL when it
+ * would not fit (caller fails LOUDLY — fail closed, never truncate). */
+static char *build_landlock_spec(const char *workdir, const char *src_ro,
+                                 const char *store_root) {
+    char buf[512];
+    size_t off = 0;
+    int first = 1;
+    if (spec_append(buf, sizeof buf, &off, &first, store_root, "r") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, src_ro,     "rx") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, workdir,    "rwcx") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, "/usr",     "rx") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, "/bin",     "rx") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, "/lib",     "rx") != 0 ||
+        (is_dir2("/lib64") &&
+         spec_append(buf, sizeof buf, &off, &first, "/lib64", "rx") != 0) ||
+        spec_append(buf, sizeof buf, &off, &first, "/etc",     "r") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, "/dev",     "rwc") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, "/proc",    "r") != 0 ||
+        spec_append(buf, sizeof buf, &off, &first, "/tmp",     "rwc") != 0)
+        return NULL;
+    if (strlen(buf) >= FX_LANDLOCK_SPEC_MAX) return NULL;
+    return strdup(buf);
+}
+
+/* fork + exec real_argv under bwrap with stage3 as /init; on bwrap-ENOENT
+ * fall back LOUDLY to plain exec in the workdir (stage3-absent, by
+ * contrast, dies 127 — see the child below).  Returns the child's exit
+ * code (2 if signaled). */
 static int run_sandboxed(const char *workdir, const char *src_ro,
                          const char *store_root, char **real_argv) {
     pid_t pid = fork();
@@ -158,7 +302,24 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         return 2;
     }
     if (pid == 0) {
-        /* ── child ── build: bwrap [binds...] -- real_argv... */
+        /* ── child ── nothing below may degrade into a LESS-sandboxed exec:
+         * stage3 must be reachable or we die (127) LOUDLY. */
+        scrub_env();
+        char *spec = build_landlock_spec(workdir, src_ro, store_root);
+        if (!spec) {
+            fprintf(stderr, "fxstore: cannot build LANDLOCK_SPEC for this build "
+                            "(store/src/workdir paths too long)\n");
+            _exit(127);
+        }
+        const char *st3 = stage3_bin();
+        if (access(st3, X_OK) != 0) {
+            fprintf(stderr,
+                "fxstore: stage3 not found or not executable at '%s': %s\n"
+                "fxstore: build it with 'make stage3' (vendor/palisade)\n",
+                st3, strerror(errno));
+            _exit(127);
+        }
+        /* ── build: bwrap [binds...] -- /init PROMISES SPEC -- real_argv... */
         char **av = NULL;
         int n = 0, cap = 0;
         int oom = 0;
@@ -166,6 +327,11 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         PUSH("bwrap");
         PUSH("--unshare-all");          /* no net, no IPC, no new mounts... */
         PUSH("--die-with-parent");
+        PUSH("--uid"); PUSH("1000");    /* never uid 0 inside, even when the
+                                           caller is root; bwrap maps 1000 ->
+                                           the caller's real uid, so workdir/
+                                           store writes keep their ownership */
+        PUSH("--gid"); PUSH("1000");
         PUSH("--ro-bind"); PUSH(store_root); PUSH(store_root);
         PUSH("--ro-bind"); PUSH("/usr"); PUSH("/usr");
         PUSH("--ro-bind"); PUSH("/bin"); PUSH("/bin");
@@ -176,6 +342,16 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         PUSH("--chdir"); PUSH(workdir);
         PUSH("--dev"); PUSH("/dev");
         PUSH("--proc"); PUSH("/proc");
+        PUSH("--ro-bind"); PUSH(st3); PUSH("/init");
+        PUSH("--");
+        /* stage3's argv is POSITIONAL — it takes NO --promises/--landlock
+         * flags: [promises...] [landlock-spec...] -- cmd.  Its parser puts
+         * every word containing ':' into the spec and joins the rest into
+         * the promise string, so PROMISES (no ':') and spec are each pushed
+         * as ONE argv word. */
+        PUSH("/init");
+        PUSH(FXSTORE_PROMISES);
+        PUSH(spec);
         PUSH("--");
         for (int i = 0; real_argv[i]; i++) PUSH(real_argv[i]);
         PUSH(NULL);
@@ -184,7 +360,9 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
 
         execvp("bwrap", av);
         if (errno == ENOENT) {
-            /* LOUD, never-silent non-hermetic fallback */
+            /* LOUD, never-silent non-hermetic fallback — ONLY for a missing
+             * bwrap.  (A missing stage3 already died above; env is scrubbed
+             * here too, so not even the fallback leaks RATTAN_/LD_ vars.) */
             fprintf(stderr,
                 "\n*** fxstore: WARNING: bwrap not found — running NON-HERMETIC "
                 "(unsandboxed): %s ***\n\n", real_argv[0]);

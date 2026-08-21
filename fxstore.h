@@ -219,22 +219,37 @@ int fx_store_build(FxStore *s, const Package *p, const char *hash,
  * mid-GC leaves reapable orphan dirs, never dangling metadata. */
 int fx_store_gc(FxStore *s, const char *root_pkg, char *err, size_t errcap);
 
-/* ─── U5: build.c — recipe executor + bwrap sandbox ───────────────────── */
+/* ─── U5: build.c — recipe executor + bwrap/stage3 sandbox ───────────── */
+
+/* Resolve (exactly once, from the FXSTORE_STAGE3 environment override if
+ * set at startup, else the compile-time vendor/palisade bin/stage3 path)
+ * the stage3 sandbox binary that Shell/Run actions exec as /init inside
+ * their bwrap sandbox (seccomp + Landlock hardening).  Call from main()
+ * before loading any package set: recipes can set arbitrary env vars via
+ * the Env action, and this must already be settled when they run. */
+void fx_stage3_resolve(void);
 
 /* Execute the package's recipe inside `workdir` (the temp build dir):
  * relative paths resolve against workdir; deps are exported as
  * FX_DEP_<NAME> environment variables (NAME uppercased, non-alnum -> '_');
  * the two EXECUTING actions (Shell, Run) run under
- *   bwrap --unshare-all --die-with-parent
+ *   bwrap --unshare-all --die-with-parent --uid 1000 --gid 1000
  *        --ro-bind <store_root> <store_root>
  *        --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib
  *        [--ro-bind /lib64 /lib64] [--ro-bind <src> <src>]
  *        --bind <workdir> <workdir> --chdir <workdir>
- *        --dev /dev --proc /proc -- <argv | /bin/sh -c cmd>
- * (network OFF; unprivileged; source tree read-only).  If bwrap is absent
- * the child prints a LOUD NON-HERMETIC warning and falls back to plain
- * fork/exec in the workdir.  Returns the first failing action's exit code,
- * or -1 on an executor error (err set). */
+ *        --dev /dev --proc /proc
+ *        --ro-bind <stage3> /init
+ *        -- /init <PROMISES> <LANDLOCK_SPEC> -- <argv | /bin/sh -c cmd>
+ * where stage3 (palisade, vendor/palisade) applies no_new_privs ->
+ * Landlock (unveil of exactly the bind-mounted paths — never "/") ->
+ * rlimits -> seccomp before exec'ing the recipe command.  RATTAN_ and LD_
+ * env vars are scrubbed from the child first (stage3 reads
+ * RATTAN_ALLOW_PTRACE/RATTAN_EXTRA_PROMISES/RATTAN_RLIMITS; LD_PRELOAD
+ * injects into the exec chain).  stage3-absent fails LOUDLY (127); if
+ * bwrap is absent the child prints a LOUD NON-HERMETIC warning and falls
+ * back to plain fork/exec in the workdir.  Returns the first failing
+ * action's exit code, or -1 on an executor error (err set). */
 int fx_build_recipe(const Package *p, const char *workdir,
                     char *const *dep_names, char *const *dep_paths, int ndeps,
                     const char *store_root, char *err, size_t errcap);

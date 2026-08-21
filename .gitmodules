@@ -6,3 +6,7 @@
 	path = vendor/datalog-dafsa
 	url = https://github.com/fixpoint-linux/datalog-dafsa.git
 	branch = main
+[submodule "vendor/palisade"]
+	path = vendor/palisade
+	url = https://github.com/fixpoint-linux/palisade
+	branch = main
