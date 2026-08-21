@@ -422,20 +422,24 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
          * the /build mountpoint for the workdir bind — a tmpfs does it for
          * us (verified on a btrfs-root host), then the workdir rw bind
          * overlays it.  Without this, bwrap dies "Can't mkdir /build:
-         * Read-only file system". */
+         * Read-only file system".  stage3 is bound and exec'd at its REAL
+         * host path (not a synthesized /init): under the ro-bound root,
+         * bwrap cannot create a /init mountpoint either ("Can't create file
+         * at /init: Read-only file system"), but the real host path already
+         * exists under the bound /, so --ro-bind <st3> <st3> works. */
         PUSH("--tmpfs"); PUSH("/build");
         PUSH("--bind"); PUSH(workdir); PUSH("/build");
         PUSH("--chdir"); PUSH("/build");
         PUSH("--dev"); PUSH("/dev");
         PUSH("--proc"); PUSH("/proc");
-        PUSH("--ro-bind"); PUSH(st3); PUSH("/init");
+        PUSH("--ro-bind"); PUSH(st3); PUSH(st3);
         PUSH("--");
         /* stage3's argv is POSITIONAL — it takes NO --promises/--landlock
          * flags: [promises...] [landlock-spec...] -- cmd.  Its parser puts
          * every word containing ':' into the spec and joins the rest into
          * the promise string, so PROMISES (no ':') and spec are each pushed
          * as ONE argv word. */
-        PUSH("/init");
+        PUSH(st3);                   /* exec stage3 at its REAL host path */
         PUSH(FXSTORE_PROMISES);
         PUSH(spec);
         PUSH("--");
