@@ -34,9 +34,19 @@ ok()   { echo "  ok: $*"; }
 [ -f "$M3DIR/package-set.dhall" ] || fail "m3/package-set.dhall missing"
 ok "m3/package-set.dhall present"
 
-# --- gate: can we actually sandbox here? ---
+# --- gate: can we actually sandbox here? (mirror fxstore_sandboxed.sh part B) ---
 if ! command -v bwrap >/dev/null 2>&1; then
     echo "SKIP: bwrap not found — cannot exercise the sandboxed M3 build"
+    exit 0
+fi
+# Probe the real stack: if bwrap is present but cannot sandbox (userns setup
+# blocked, e.g. inside another sandbox), skip loudly rather than fail the build.
+PROBE_ERR="$WORK/probe.err"
+if ! bwrap --unshare-all --ro-bind / / --ro-bind /usr /usr --dev /dev \
+           --proc /proc --tmpfs /tmp \
+           -- /bin/sh -c 'exit 0' >"$PROBE_ERR" 2>&1; then
+    echo "SKIP: bwrap cannot sandbox on this host (probe: $(head -n1 "$PROBE_ERR"))"
+    echo "      (e.g. inside another sandbox whose seccomp blocks userns setup)"
     exit 0
 fi
 
