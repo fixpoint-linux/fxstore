@@ -374,6 +374,16 @@ static int run_sandboxed(const char *workdir, const char *src_ro,
         PUSH("bwrap");
         PUSH("--unshare-all");          /* no net, no IPC, no new mounts... */
         PUSH("--die-with-parent");
+        /* Bind the host root: bwrap pivots to a fresh root and only what is
+         * explicitly bound appears there.  WITHOUT `--ro-bind / /`, binding
+         * only subdirs (/usr /bin /lib) leaves the namespace root EMPTY on
+         * some kernels (verified on node-infra / btrfs-root, cosmocc 14.1.0):
+         * exec of the recipe fails with "No such file or directory" even
+         * though /usr is bound.  Binding / first populates the root so the
+         * subdir binds resolve.  (This does NOT weaken hermeticity: the
+         * read-only binds + Landlock spec still gate what the recipe can
+         * touch; see build_landlock_spec.) */
+        PUSH("--ro-bind"); PUSH("/"); PUSH("/");
         PUSH("--uid"); PUSH("1000");    /* never uid 0 inside, even when the
                                            caller is root; bwrap maps 1000 ->
                                            the caller's real uid, so workdir/

@@ -225,7 +225,11 @@ if ! command -v bwrap >/dev/null 2>&1; then
     exit 0
 fi
 PROBE_ERR="$WORK/probe.err"
-if ! bwrap --unshare-all --ro-bind /usr /usr --dev /dev --proc /proc --tmpfs /tmp \
+# Probe uses the same argv shape as production run_sandboxed, INCLUDING
+# `--ro-bind / /` (without it, subdir binds leave an empty root on some
+# kernels and the probe falsely skips — verified on a btrfs-root host).
+if ! bwrap --unshare-all --ro-bind / / --ro-bind /usr /usr --dev /dev \
+           --proc /proc --tmpfs /tmp \
            -- /bin/sh -c 'exit 0' >"$PROBE_ERR" 2>&1; then
     echo "SKIP part B: bwrap cannot sandbox on this host (probe: $(head -n1 "$PROBE_ERR"))"
     echo "      (e.g. inside another sandbox whose seccomp blocks userns setup;"
