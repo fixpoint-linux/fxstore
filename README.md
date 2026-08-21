@@ -32,22 +32,27 @@ See the [fixpoint-linux design](https://github.com/fixpoint-linux/fixpoint-linux
 
 ## Dependencies
 
-Two git submodules (under `vendor/`), initialized via `git submodule update --init --recursive`:
+Git submodules, initialized via `git submodule update --init --recursive`:
 
-- [`datalog-dafsa`](https://github.com/fixpoint-linux/datalog-dafsa) — the engine + vendored dafsa
-- [`dhall-c`](https://github.com/fixpoint-linux/dhall-c) — the Dhall interpreter core
+- [`datalog-dafsa`](https://github.com/fixpoint-linux/datalog-dafsa) — the engine + vendored dafsa (under `vendor/`)
+- [`dhall-c`](https://github.com/fixpoint-linux/dhall-c) — the Dhall interpreter core (under `vendor/`)
+- [`palisade`](https://github.com/fixpoint-linux/palisade) — the stage3 inner sandbox binary (under `vendor/`)
+- [`dhake`](https://github.com/fixpoint-linux/dhake) — the build driver (`Dhakefile.dhall`, under `dhake/`)
 
 Requires the **cosmocc** toolchain.
 
 ## Build
 
 ```sh
-make             # builds ./fxstore
-make test        # runs the golden end-to-end test
-make fxstore-golden
+./dhake/dhake.com            # builds ./fxstore (default target)
+./dhake/dhake.com test       # runs every test suite
+./dhake/dhake.com fxstore-golden
+./dhake/dhake.com stage3     # build the palisade stage3 sandbox binary
+./dhake/dhake.com clean      # remove the native binaries
 ```
 
-Override dependency paths with `make DATALOG=... DHALLC=...`.
+The native build is driven entirely by `./Dhakefile.dhall` (no Makefile); the
+docs-site build lives in the same buildfile (`./dhake/dhake.com dist/index.html`).
 
 ## Usage
 
