@@ -217,6 +217,27 @@ in  { targets =
           , mapValue = { deps = [ "fxstore" ], phony = True
                        , recipe = [ < Shell = "sh tests/fxstore_timeline.sh ./fxstore" > ] }
           }
+        -- ─── Zig port ───────────────────────────────────────────────────────
+        -- The Zig port (zig/src/*.zig + repo-root build.zig) builds the same
+        -- `fxstore` CLI to zig-out/bin/fxstore.  `zig` builds it; `zig-test`
+        -- runs the port's unit tests; `zig-diff` byte-compares the Zig binary
+        -- against the C oracle over the shared corpus (the final gate).
+        , { mapKey = "zig"
+          , mapValue =
+              { deps = [ "build.zig", "vendor/palisade/bin/stage3" ]
+              , phony = True
+              , recipe = [ < Shell = "zig build" > ]
+              }
+          }
+        , { mapKey = "zig-test"
+          , mapValue = { deps = [ "zig" ], phony = True
+                       , recipe = [ < Shell = "zig build test" > ] }
+          }
+        , { mapKey = "zig-diff"
+          , mapValue = { deps = [ "zig", "fxstore" ], phony = True
+                       , recipe = [ < Shell = "sh zig/diff.sh" > ] }
+          }
+
         , { mapKey = "test"
           , mapValue =
               { deps =
@@ -226,6 +247,8 @@ in  { targets =
                   , "fxstore-repro"
                   , "fxstore-excludes"
                   , "fxstore-timeline"
+                  , "zig-test"
+                  , "zig-diff"
                   ]
               , phony = True
               , recipe = [] : List Action
@@ -241,6 +264,8 @@ in  { targets =
                   [ < Rm = "fxstore" >
                   , < Rm = "fxstore.aarch64.elf" >
                   , < Rm = "fxstore.com.dbg" >
+                  , < Rm = "zig-out" >
+                  , < Rm = ".zig-cache" >
                   ]
               }
           }

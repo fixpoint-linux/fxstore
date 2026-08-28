@@ -1,0 +1,20 @@
+fxstore — content-addressed build store (M0/M1/M2 MVP)
+usage:
+  fxstore init [dir]                     scaffold a project dir
+  fxstore build [--store DIR] [<pkg>...]  build the closure of <pkg>...
+                                          (all packages when none), print store paths
+  fxstore query <pkg> [--store DIR]      print <pkg>'s closure names + store path
+  fxstore gc [<root>] [--retain N] [--store DIR]
+                                          prune store dirs/facts unreachable from <root>
+                                          (--retain N: keep N most-recent snapshots instead)
+  fxstore timeline [--store DIR]         list every snapshot version, marking CURRENT
+  fxstore rollback [--hard] <v> [--store DIR]
+                                          roll the store back to snapshot version <v>
+                                          (default roll-forward; --hard repoints CURRENT)
+options:
+  --store DIR   store root (default: /fx/store)
+  --retain N    (gc) keep the N most-recent snapshot versions, prune the rest
+  -n N          same as --retain N
+  --hard        (rollback) recovery-only: repoint CURRENT directly at <v>, no new version
+  -h, --help    show this help
+build/query load "package-set.dhall" from the current directory.

@@ -2,6 +2,10 @@ fxstore
 fxstore.aarch64.elf
 fxstore.com.dbg
 
+# Zig build artifacts (source lives in build.zig + zig/; these are generated).
+.zig-cache/
+zig-out/
+
 # Elm docs app — tooling and generated build output (never committed).
 node_modules/
 elm-stuff/
