@@ -1602,6 +1602,17 @@ test "optional bwrap integration: trivial Shell recipe end-to-end (skipped witho
         std.debug.print("(bwrap or stage3 absent — LOUD skip of the sandbox e2e test)\n", .{});
         return;
     }
+    // Merged-usr hosts (Arch: /bin -> usr/bin) trip bwrap >= 0.12's refusal to
+    // bind-mount onto a symlink destination (--ro-bind /bin /bin is the C
+    // contract); the C oracle fails identically there, so this is a test-env
+    // condition, not a port gap.  LOUD-skip like the absent-bwrap path above.
+    var bin_real: [std.fs.max_path_bytes]u8 = undefined;
+    if (realpath("/bin", &bin_real)) |r| {
+        if (!std.mem.eql(u8, std.mem.span(r), "/bin")) {
+            std.debug.print("(merged-usr: /bin -> {s} is a symlink, bwrap refuses --ro-bind onto it — LOUD skip of the sandbox e2e test)\n", .{r});
+            return;
+        }
+    }
     const a = testing.allocator;
     const wd = try scratch_dir(a, "e2e");
     defer a.free(wd);

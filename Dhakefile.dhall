@@ -1,17 +1,17 @@
 -- Dhakefile.dhall — build fxstore's native CLI and its docs site with dhake.
 --
 -- Native build (replaces the old Makefile):
---    ./dhake/dhake.com            # default target: ./fxstore
+--    ./dhake/dhake.com            # default target: the Zig port (zig-out/bin/fxstore)
 --    ./dhake/dhake.com stage3     # build the palisade stage3 sandbox binary
---    ./dhake/dhake.com fxstore-golden   # run a test suite
+--    ./dhake/dhake.com zig-test   # run the port's unit tests
 --    ./dhake/dhake.com test       # run every test suite
 --    ./dhake/dhake.com clean      # remove the native binaries
 --
---   `fxstore` links this repo's C sources (main/packageset/derivation/closure/
---   store/build) with the datalog-dafsa engine + vendored dafsa (vendor/
---   datalog-dafsa submodule) and the dhall-c interpreter core (vendor/dhall-c
---   submodule), using cosmocc, and bakes in the palisade stage3 sandbox binary
---   (vendor/palisade submodule).  Requires the cosmocc toolchain.
+--   The CLI is the Zig port (root build.zig + zig/src): `zig` runs `zig build`
+--   and bakes in the palisade stage3 sandbox binary (vendor/palisade
+--   submodule).  Requires the Zig toolchain.  The C oracle sources were
+--   removed (U2); the pre-built C binary ./fxstore, if present, is only the
+--   frozen differential-harness reference (zig-diff).
 --
 -- Web build:
 --    ./dhake/dhake.com dist/index.html   # the docs site (Elm + MFE + SSG)
@@ -39,65 +39,6 @@ let Action =
       >
 
 let Target = { deps : List Text, phony : Bool, recipe : List Action }
-
--- ─── native build sources (mirror the old Makefile lists) ──────────────────
--- dhall-c interpreter core sources (linked directly, in dhall-c's own order;
--- exclude its entry-point/extra TUs: main/wasm/bench/lsp and json.c which only
--- LSP links).
-let core =
-      [ "vendor/dhall-c/src/arena.c"
-      , "vendor/dhall-c/src/lexer.c"
-      , "vendor/dhall-c/src/parser.c"
-      , "vendor/dhall-c/src/ast.c"
-      , "vendor/dhall-c/src/normalize.c"
-      , "vendor/dhall-c/src/typecheck.c"
-      , "vendor/dhall-c/src/builtins.c"
-      , "vendor/dhall-c/src/serialize.c"
-      , "vendor/dhall-c/src/import.c"
-      , "vendor/dhall-c/src/bignum.c"
-      , "vendor/dhall-c/src/sha256.c"
-      , "vendor/dhall-c/src/ssrf.c"
-      , "vendor/dhall-c/src/http.c"
-      ]
-
--- datalog-dafsa engine + vendored dafsa sources (excluding the TUs that carry
--- their own entry points: dl_cli.c main, lsp.c main, playground-wasm.c).
-let engine =
-      [ "vendor/datalog-dafsa/src/intern.c"
-      , "vendor/datalog-dafsa/src/termstore.c"
-      , "vendor/datalog-dafsa/src/relation.c"
-      , "vendor/datalog-dafsa/src/vrelation.c"
-      , "vendor/datalog-dafsa/src/tupleset.c"
-      , "vendor/datalog-dafsa/src/parser.c"
-      , "vendor/datalog-dafsa/src/compiler.c"
-      , "vendor/datalog-dafsa/src/vm.c"
-      , "vendor/datalog-dafsa/src/snapshot.c"
-      , "vendor/datalog-dafsa/src/regexwalk.c"
-      , "vendor/datalog-dafsa/src/permindex.c"
-      , "vendor/datalog-dafsa/src/util.c"
-      , "vendor/datalog-dafsa/src/dl.c"
-      , "vendor/datalog-dafsa/src/iter.c"
-      , "vendor/datalog-dafsa/src/magic.c"
-      , "vendor/datalog-dafsa/src/topdown.c"
-      , "vendor/datalog-dafsa/src/analyze.c"
-      , "vendor/datalog-dafsa/src/schema.c"
-      , "vendor/datalog-dafsa/src/typecheck.c"
-      , "vendor/datalog-dafsa/src/json.c"
-      , "vendor/datalog-dafsa/src/txnwal.c"
-      , "vendor/datalog-dafsa/vendor/dafsa.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_state.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_core.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_persist.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_view.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_crc32.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_wal.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_build.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_rank.c"
-      , "vendor/datalog-dafsa/vendor/dafsa_view_rank.c"
-      ]
-
-let fxs =
-      [ "main.c", "packageset.c", "derivation.c", "closure.c", "store.c", "build.c" ]
 
 -- The palisade stage3 inner sandbox binary (seccomp/Landlock layer).  Built by
 -- delegating to palisade's own Dhakefile (vendor/palisade/Dhakefile.dhall); the
@@ -128,70 +69,6 @@ in  { targets =
               , recipe = [] : List Action
               }
           }
-        , { mapKey = "fxstore"
-          , mapValue =
-              { deps = [ "fxstore.h", "vendor/palisade/bin/stage3" ] # fxs # core # engine
-              , phony = False
-              , recipe =
-                  -- Single cosmocc link, mirroring the old Makefile rule.
-                  [ < Shell =
-                        "cosmocc -std=c11 -O2 -g -Wall -Wextra "
-                      ++ "-I vendor/dhall-c/src -I vendor/datalog-dafsa/vendor "
-                      ++ "-I vendor/datalog-dafsa/src "
-                      ++ "-DFXSTORE_STAGE3_PATH=\"\\\"$PWD/"
-                      ++ stage3_path
-                      ++ "\\\"\" "
-                      ++ "-o fxstore "
-                      ++ "main.c packageset.c derivation.c closure.c store.c build.c "
-                      ++ "vendor/datalog-dafsa/src/intern.c "
-                      ++ "vendor/datalog-dafsa/src/termstore.c "
-                      ++ "vendor/datalog-dafsa/src/relation.c "
-                      ++ "vendor/datalog-dafsa/src/vrelation.c "
-                      ++ "vendor/datalog-dafsa/src/tupleset.c "
-                      ++ "vendor/datalog-dafsa/src/parser.c "
-                      ++ "vendor/datalog-dafsa/src/compiler.c "
-                      ++ "vendor/datalog-dafsa/src/vm.c "
-                      ++ "vendor/datalog-dafsa/src/snapshot.c "
-                      ++ "vendor/datalog-dafsa/src/regexwalk.c "
-                      ++ "vendor/datalog-dafsa/src/permindex.c "
-                      ++ "vendor/datalog-dafsa/src/util.c "
-                      ++ "vendor/datalog-dafsa/src/dl.c "
-                      ++ "vendor/datalog-dafsa/src/iter.c "
-                      ++ "vendor/datalog-dafsa/src/magic.c "
-                      ++ "vendor/datalog-dafsa/src/topdown.c "
-                      ++ "vendor/datalog-dafsa/src/analyze.c "
-                      ++ "vendor/datalog-dafsa/src/schema.c "
-                      ++ "vendor/datalog-dafsa/src/typecheck.c "
-                      ++ "vendor/datalog-dafsa/src/json.c "
-                      ++ "vendor/datalog-dafsa/src/txnwal.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_state.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_core.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_persist.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_view.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_crc32.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_wal.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_build.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_rank.c "
-                      ++ "vendor/datalog-dafsa/vendor/dafsa_view_rank.c "
-                      ++ "vendor/dhall-c/src/arena.c "
-                      ++ "vendor/dhall-c/src/lexer.c "
-                      ++ "vendor/dhall-c/src/parser.c "
-                      ++ "vendor/dhall-c/src/ast.c "
-                      ++ "vendor/dhall-c/src/normalize.c "
-                      ++ "vendor/dhall-c/src/typecheck.c "
-                      ++ "vendor/dhall-c/src/builtins.c "
-                      ++ "vendor/dhall-c/src/serialize.c "
-                      ++ "vendor/dhall-c/src/import.c "
-                      ++ "vendor/dhall-c/src/bignum.c "
-                      ++ "vendor/dhall-c/src/sha256.c "
-                      ++ "vendor/dhall-c/src/ssrf.c "
-                      ++ "vendor/dhall-c/src/http.c"
-                    >
-                  ]
-              }
-          }
-
         -- ─── tests ──────────────────────────────────────────────────────────
         , { mapKey = "fxstore-golden"
           , mapValue = { deps = [ "fxstore" ], phony = True
@@ -331,5 +208,5 @@ in  { targets =
               }
           }
         ]
-      , default = "fxstore"
+      , default = "zig"
       }

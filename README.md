@@ -39,20 +39,23 @@ Git submodules, initialized via `git submodule update --init --recursive`:
 - [`palisade`](https://github.com/fixpoint-linux/palisade) — the stage3 inner sandbox binary (under `vendor/`)
 - [`dhake`](https://github.com/fixpoint-linux/dhake) — the build driver (`Dhakefile.dhall`, under `dhake/`)
 
-Requires the **cosmocc** toolchain.
+Requires the **Zig** toolchain.
 
 ## Build
 
 ```sh
-./dhake/dhake.com            # builds ./fxstore (default target)
+./dhake/dhake.com            # builds the Zig port -> zig-out/bin/fxstore (default target)
 ./dhake/dhake.com test       # runs every test suite
-./dhake/dhake.com fxstore-golden
+./dhake/dhake.com zig-test
 ./dhake/dhake.com stage3     # build the palisade stage3 sandbox binary
 ./dhake/dhake.com clean      # remove the native binaries
 ```
 
 The native build is driven entirely by `./Dhakefile.dhall` (no Makefile); the
 docs-site build lives in the same buildfile (`./dhake/dhake.com dist/index.html`).
+The original C implementation was removed after the line-for-line Zig port was
+verified against it (`sh zig/diff.sh`); `zig/corpus/derivation/` keeps the C
+golden generator that pins the derivation goldens.
 
 ## Usage
 
