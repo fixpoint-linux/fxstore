@@ -26,8 +26,9 @@
 // 330-351): each query runs on a private arena for scratch; strings that
 // ESCAPE (WhatResult/WhyResult fields) are c_allocator-owned and freed by
 // prov_free_what / prov_free_why.  Drifts appended by prov_verify are
-// c_allocator-owned too (target + detail + the list storage) — free them
-// with prov_free_drifts.
+// c_allocator-owned: the target/detail strings are freed by prov_free_drifts;
+// the caller's ArrayList backing buffer is freed separately via deinit(c_alloc)
+// (prov_free_drifts does NOT free the list storage).
 //
 // This module imports ONLY std + closure/store/packageset/derivation; it
 // must never import main.zig (which has its own main) or write any
@@ -588,15 +589,47 @@ fn add_drift(out: *std.ArrayList(Drift), target: []const u8, kind: DriftKind, de
     };
 }
 
+/// sha256 of a regular file's bytes as lowercase hex — the single-file
+/// companion of derivation.zig's sha256_file_copy (open → read →
+/// sha256_hex), streamed in fixed chunks so verification stays O(path)
+/// without a whole-file allocation (fx_content_hash_dir is for dirs).
+/// FileNotFound returns false so the CALLER decides whether an absent file
+/// is a skip or a hard case; every other open/read failure is a hard error
+/// (the pass-1 stat convention).
+fn file_sha256(io: Io, path: []const u8, out: *[64]u8, e: *ProvErrBuf) ProvError!bool {
+    var f = Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        if (err == error.FileNotFound) return false;
+        return e.set("cannot open '{s}': {s}", .{ path, @errorName(err) });
+    };
+    defer f.close(io);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var off: u64 = 0;
+    while (true) {
+        var chunk: [16 * 1024]u8 = undefined;
+        const n = f.readPositional(io, &.{chunk[0..]}, off) catch |err|
+            return e.set("read error on '{s}': {s}", .{ path, @errorName(err) });
+        if (n == 0) break; // EOF
+        h.update(chunk[0..n]);
+        off += n;
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    h.final(&digest);
+    out.* = std.fmt.bytesToHex(digest, .lower);
+    return true;
+}
+
 /// Compare the rootfs against the install facts as-of `v` and append one
 /// Drift per divergence to `out` (c_allocator-owned — free with
 /// prov_free_drifts).  Per install fact: the target must exist, be the
 /// recorded KIND (mode 0 = symlink to {store_root}/{origin}, else a
-/// regular file) and carry the recorded mode bits.  Then every entry in
-/// the install targets' parent dirs (/etc, /bin, ...) that no install fact
-/// records is unmanaged drift.  The `hash` kind (etc-file content vs the
-/// store copy) is the U5 reconcile extension.  A snapshot predating the
-/// install relation reads as empty: verify then reports nothing (no
+/// regular file) and carry the recorded mode bits.  Regular-file facts
+/// (the etc Copies) are additionally content-hashed against the store
+/// origin at {store_root}/{origin} — a byte difference is `hash` drift;
+/// an origin ABSENT from the store (generation pruned, or a fixture
+/// without one) is skipped: no origin, no comparison, not rootfs drift.
+/// Then every entry in the install targets' parent dirs (/etc, /bin, ...)
+/// that no install fact records is unmanaged drift.  A snapshot predating
+/// the install relation reads as empty: verify then reports nothing (no
 /// knowledge, no drift), never an error.
 pub fn prov_verify(
     io: Io,
@@ -687,6 +720,30 @@ pub fn prov_verify(
                 const det = std.fmt.bufPrint(&tb, "mode 0o{o} != recorded 0o{o}", .{ actual, mode }) catch "mode mismatch";
                 try add_drift(out, target, .mode, det, e);
             }
+
+            // U5 — the content check for store-relative etc copies: the
+            // target's bytes must equal the origin copy at
+            // {store_root}/{origin} (bin-symlink facts, mode 0, never get
+            // here — a symlink has no content of its own).  Only actual
+            // regular files are hashed; openFile on e.g. a fifo would
+            // block.  Either side unreadable (origin pruned, or a race
+            // deleted the target mid-verify) skips the comparison — the
+            // absent-as-empty principle — so `th`/`oh` are only compared
+            // when both were written.
+            if (fst.kind == .file) {
+                var ob: [2 * st.FX_PATH_MAX]u8 = undefined;
+                const opath = std.fmt.bufPrint(&ob, "{s}/{s}", .{ sr, origin }) catch
+                    return e.set("store path too long: {s}/{s}", .{ sr, origin });
+                var th: [64]u8 = undefined;
+                var oh: [64]u8 = undefined;
+                const t_ok = try file_sha256(io, full, &th, e);
+                const o_ok = try file_sha256(io, opath, &oh, e);
+                if (t_ok and o_ok and !std.mem.eql(u8, &th, &oh)) {
+                    var tb: [2 * st.FX_PATH_MAX + 192]u8 = undefined; // path + 2x64 hex
+                    const det = std.fmt.bufPrint(&tb, "content hash {s} != origin hash {s} (origin {s})", .{ &th, &oh, opath }) catch "content hash mismatch";
+                    try add_drift(out, target, .hash, det, e);
+                }
+            }
         }
     }
 
@@ -719,8 +776,9 @@ pub fn prov_verify(
 }
 
 /// Caller-frees contract of prov_verify's appended drifts (each target +
-/// detail + the list storage).  The pinned API has no drift free fn; this
-/// mirrors prov_free_what/why so callers never leak.
+/// detail string).  The list STORAGE is the caller's ArrayList backing buffer
+/// and is freed separately via deinit(c_alloc).  Mirrors prov_free_what/why so
+/// callers never leak.
 pub fn prov_free_drifts(drifts: []Drift) void {
     for (drifts) |dr| {
         c_alloc.free(dr.target);
@@ -804,6 +862,16 @@ fn activate(db: *DlDb) !void {
 
     if (st.dl_txn_commit(db) != 0) return error.DlTxn;
     if (cl.dl_publish_snapshot(db) != 0) return error.DlPublish;
+}
+
+/// Test-side sha256 oracle (same primitive as file_sha256, so the drift
+/// DETAIL can be asserted to carry the real digests).
+fn hex_of(data: []const u8, out: *[64]u8) void {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(data);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    h.final(&digest);
+    out.* = std.fmt.bytesToHex(digest, .lower);
 }
 
 test "prov_what: current + as-of, pkg resolution, pullers, error paths" {
@@ -1139,7 +1207,7 @@ test "prov_verify: drift taxonomy + clean rootfs + old-snapshot absent-as-empty"
                 try testing.expect(std.mem.eql(u8, dr.target, "/bin/rogue") or
                     std.mem.eql(u8, dr.target, "/etc/stray"));
             },
-            .hash => return error.UnexpectedHashDrift, // U5's extension
+            .hash => return error.UnexpectedHashDrift, // impossible here: this fixture has no store-side etc origins (the skip rule)
         }
     }
     try testing.expectEqual(@as(usize, 1), seen_missing);
@@ -1151,6 +1219,130 @@ test "prov_verify: drift taxonomy + clean rootfs + old-snapshot absent-as-empty"
     e = .{};
     try testing.expectError(error.FxProv, prov_verify(io, db, rootfs, store, .{ .as_of = 99 }, &e, &drifts));
     try testing.expectEqualStrings("no such version 99 (have 2 version(s))", e.slice());
+}
+
+test "prov_verify: etc-copy content-hash drift (U5)" {
+    const io = tio();
+    var dir_buf: [64:0]u8 = undefined;
+    const dir = try temp_db_dir(&dir_buf);
+    const db = cl.dl_open(dir.ptr) orelse return error.DlOpenFailed;
+    defer {
+        cl.dl_close(db);
+        Io.Dir.cwd().deleteTree(tio(), dir) catch {};
+    }
+    var pe = pkgs.ErrBuf{};
+    var pset: pkgs.PackageSet = undefined;
+    try pkgs.fx_packageset_load(&pset, "zig/corpus/packageset/good.dhall", &pe);
+    defer pset.deinit();
+    var ce = cl.ErrBuf{};
+    try cl.fx_closure_compute(db, &pset, &.{}, &ce); // v1: old snapshot
+    try activate(db); // v2: CURRENT
+
+    var drifts: std.ArrayList(Drift) = .empty;
+    defer drifts.deinit(c_alloc);
+    defer prov_free_drifts(drifts.items);
+
+    var e = ProvErrBuf{};
+
+    // the store: bin dirs for the symlinks + the GENERATION etc copies the
+    // install origins name (this is what the taxonomy test's fixture lacks)
+    var sr_buf: [64:0]u8 = undefined;
+    const store = try temp_dir(&sr_buf, "store");
+    defer Io.Dir.cwd().deleteTree(io, store) catch {};
+    var hb1: [160:0]u8 = undefined;
+    var hb2: [160:0]u8 = undefined;
+    const dir_hello = try std.fmt.bufPrintZ(&hb1, "{s}/{s}-hello", .{ store, ha });
+    const dir_world = try std.fmt.bufPrintZ(&hb2, "{s}/{s}-world", .{ store, hb });
+    try Io.Dir.cwd().createDirPath(io, dir_hello);
+    try Io.Dir.cwd().createDirPath(io, dir_world);
+    var gb: [160:0]u8 = undefined;
+    const gen_etc = try std.fmt.bufPrintZ(&gb, "{s}/{s}-system-generation/etc", .{ store, gen });
+    try Io.Dir.cwd().createDirPath(io, gen_etc);
+    var g1: [192:0]u8 = undefined;
+    var g2: [192:0]u8 = undefined;
+    const o_motd = try std.fmt.bufPrintZ(&g1, "{s}/motd", .{gen_etc});
+    const o_hosts = try std.fmt.bufPrintZ(&g2, "{s}/hosts", .{gen_etc});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = o_motd, .data = "fx\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = o_hosts, .data = "localhost\n" });
+
+    // the rootfs: every recorded target exactly as installed
+    var rf_buf: [64:0]u8 = undefined;
+    const rootfs = try temp_dir(&rf_buf, "rootfs");
+    defer Io.Dir.cwd().deleteTree(io, rootfs) catch {};
+    var p1: [160:0]u8 = undefined;
+    var p2: [160:0]u8 = undefined;
+    const bin_dir = try std.fmt.bufPrintZ(&p1, "{s}/bin", .{rootfs});
+    const etc_dir = try std.fmt.bufPrintZ(&p2, "{s}/etc", .{rootfs});
+    try Io.Dir.cwd().createDirPath(io, bin_dir);
+    try Io.Dir.cwd().createDirPath(io, etc_dir);
+    var l1: [128:0]u8 = undefined;
+    var l2: [128:0]u8 = undefined;
+    const link_hello = try std.fmt.bufPrintZ(&l1, "{s}/bin/hello", .{rootfs});
+    const link_world = try std.fmt.bufPrintZ(&l2, "{s}/bin/world", .{rootfs});
+    try Io.Dir.cwd().symLink(io, dir_hello, link_hello, .{});
+    try Io.Dir.cwd().symLink(io, dir_world, link_world, .{});
+    var f1: [128:0]u8 = undefined;
+    var f2: [128:0]u8 = undefined;
+    const motd = try std.fmt.bufPrintZ(&f1, "{s}/etc/motd", .{rootfs});
+    const hosts = try std.fmt.bufPrintZ(&f2, "{s}/etc/hosts", .{rootfs});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = motd, .data = "fx\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = hosts, .data = "localhost\n" });
+    // writeFile's default mode is umask-dependent (0o640 here) — the
+    // activation records 0o644, so set it explicitly like emitBuildfile's
+    // Chmod does.
+    try Io.Dir.cwd().setFilePermissions(io, motd, Io.File.Permissions.fromMode(0o644), .{});
+    try Io.Dir.cwd().setFilePermissions(io, hosts, Io.File.Permissions.fromMode(0o644), .{});
+
+    // matching content -> no drift of any kind
+    try prov_verify(io, db, rootfs, store, .current, &e, &drifts);
+    try testing.expectEqual(@as(usize, 0), drifts.items.len);
+
+    // diverging content -> EXACTLY one .hash drift, carrying both real
+    // digests and the store origin it was compared against
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = motd, .data = "tampered\n" });
+    try Io.Dir.cwd().setFilePermissions(io, motd, Io.File.Permissions.fromMode(0o644), .{});
+    try prov_verify(io, db, rootfs, store, .current, &e, &drifts);
+    try testing.expectEqual(@as(usize, 1), drifts.items.len);
+    {
+        const dr = drifts.items[0];
+        try testing.expect(dr.kind == .hash);
+        try testing.expectEqualStrings("/etc/motd", dr.target);
+        var want_t: [64]u8 = undefined;
+        var want_o: [64]u8 = undefined;
+        hex_of("tampered\n", &want_t);
+        hex_of("fx\n", &want_o);
+        try testing.expect(std.mem.indexOf(u8, dr.detail, &want_t) != null);
+        try testing.expect(std.mem.indexOf(u8, dr.detail, &want_o) != null);
+        try testing.expect(std.mem.indexOf(u8, dr.detail, o_motd) != null);
+    }
+    prov_free_drifts(drifts.items);
+    drifts.clearRetainingCapacity();
+
+    // content AND mode diverge together -> one .hash AND one .mode (the
+    // checks are independent; the mode drift does not suppress hashing)
+    try Io.Dir.cwd().setFilePermissions(io, motd, Io.File.Permissions.fromMode(0o777), .{});
+    try prov_verify(io, db, rootfs, store, .current, &e, &drifts);
+    try testing.expectEqual(@as(usize, 2), drifts.items.len);
+    var seen_hash: usize = 0;
+    var seen_mode: usize = 0;
+    for (drifts.items) |dr| {
+        switch (dr.kind) {
+            .hash => seen_hash += 1,
+            .mode => seen_mode += 1,
+            else => return error.UnexpectedDriftKind,
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), seen_hash);
+    try testing.expectEqual(@as(usize, 1), seen_mode);
+    prov_free_drifts(drifts.items);
+    drifts.clearRetainingCapacity();
+
+    // origin absent from the store (generation pruned): the content is
+    // unverifiable -> hash check skipped, ONLY the mode drift remains
+    Io.Dir.cwd().deleteFile(io, o_motd) catch {};
+    try prov_verify(io, db, rootfs, store, .current, &e, &drifts);
+    try testing.expectEqual(@as(usize, 1), drifts.items.len);
+    try testing.expect(drifts.items[0].kind == .mode);
 }
 
 test "prov_what/prov_why on a db with no published snapshot" {
