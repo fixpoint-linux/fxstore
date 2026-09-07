@@ -618,6 +618,15 @@ fn file_sha256(io: Io, path: []const u8, out: *[64]u8, e: *ProvErrBuf) ProvError
     return true;
 }
 
+/// True when `dir` (rootfs-relative, leading '/') is the store root or lies
+/// under it — the CAS is the verify's own reference material and must never
+/// be walked as unmanaged rootfs drift.
+fn dir_is_store(store_under: ?[]const u8, dir: []const u8) bool {
+    const su = store_under orelse return false;
+    if (std.mem.eql(u8, su, dir)) return true;
+    return su.len > dir.len and su[dir.len] == '/' and std.mem.startsWith(u8, su, dir);
+}
+
 /// Compare the rootfs against the install facts as-of `v` and append one
 /// Drift per divergence to `out` (c_allocator-owned — free with
 /// prov_free_drifts).  Per install fact: the target must exist, be the
@@ -627,10 +636,13 @@ fn file_sha256(io: Io, path: []const u8, out: *[64]u8, e: *ProvErrBuf) ProvError
 /// origin at {store_root}/{origin} — a byte difference is `hash` drift;
 /// an origin ABSENT from the store (generation pruned, or a fixture
 /// without one) is skipped: no origin, no comparison, not rootfs drift.
-/// Then every entry in the install targets' parent dirs (/etc, /bin, ...)
-/// that no install fact records is unmanaged drift.  A snapshot predating
-/// the install relation reads as empty: verify then reports nothing (no
-/// knowledge, no drift), never an error.
+/// Then every regular file or symlink under the dirs the generation OWNS
+/// (the top-level rootfs dirs containing install targets — /bin, /etc, ...)
+/// that no install fact records is unmanaged drift: the owned roots are
+/// walked RECURSIVELY (their subdirectories are part of the ownership),
+/// never following symlinks.  A snapshot predating the install relation
+/// reads as empty: verify then reports nothing (no knowledge, no drift),
+/// never an error.
 pub fn prov_verify(
     io: Io,
     db: ?*DlDb,
@@ -747,30 +759,67 @@ pub fn prov_verify(
         }
     }
 
-    // pass 2: unmanaged scan — walk the (deduped) parent dirs of the
-    // install targets; every non-directory entry no install fact records
-    // is drift.  No install facts (or a snapshot predating them) -> no
-    // scan: absence of knowledge is not drift.
-    var parents: std.ArrayList([]const u8) = .empty;
+    // pass 2: unmanaged scan — the generation OWNS the top-level dirs its
+    // install targets live under (the first path segment of each target
+    // below the rootfs root: /bin, /etc, ...).  Each owned root is walked
+    // RECURSIVELY — subdirectories are part of the owned root — and every
+    // regular file or symlink no install fact records is drift.  Symlinks
+    // are never followed (kinds come from the dirent, so a link-to-dir is
+    // .sym_link and never opened), which also makes the walk cycle-free;
+    // the other entry kinds (fifos, sockets, devices) are not drift
+    // candidates, matching the pass-1 taxonomy.  The store CAS is skipped
+    // when it lies under an owned root — it is the verify's own reference,
+    // never rootfs drift.  No install facts (or a snapshot predating them)
+    // -> no scan: absence of knowledge is not drift.
+    var roots: std.ArrayList([]const u8) = .empty;
     for (targets.items) |target| {
-        const dir = if (std.mem.lastIndexOfScalar(u8, target, '/')) |slash| target[0..slash] else continue;
-        if (in_names(parents.items, dir)) continue;
-        parents.append(a, dir) catch return e.set("out of memory", .{});
+        if (target.len == 0 or target[0] != '/') continue;
+        const rest = target[1..];
+        // a target directly at the root ("/x") has no owned dir: pass 1
+        // already checks it per-fact.
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+        // seg keeps the leading slash ("/bin"): rf ++ seg is then the
+        // owned root's full path and children come out rootfs-absolute.
+        const seg = target[0 .. slash + 1];
+        if (seg.len == 0 or in_names(roots.items, seg)) continue;
+        roots.append(a, seg) catch return e.set("out of memory", .{});
     }
-    for (parents.items) |dir| {
-        var pb2: [2 * st.FX_PATH_MAX]u8 = undefined;
-        const full_dir = std.fmt.bufPrint(&pb2, "{s}{s}", .{ rf, dir }) catch continue;
-        var dirh = Io.Dir.cwd().openDir(io, full_dir, .{ .iterate = true }) catch continue;
-        defer dirh.close(io);
-        var it = dirh.iterate();
-        while (it.next(io) catch null) |ent| {
-            if (ent.kind == .directory) continue;
-            var cb: [2 * st.FX_PATH_MAX]u8 = undefined;
-            const child = std.fmt.bufPrint(&cb, "{s}/{s}", .{ dir, ent.name }) catch continue;
-            if (in_names(targets.items, child)) continue;
-            var tb: [2 * st.FX_PATH_MAX]u8 = undefined;
-            const det = std.fmt.bufPrint(&tb, "present under {s} but no install fact records it (as-of version {d})", .{ dir, ver }) catch "unmanaged";
-            try add_drift(out, child, .unmanaged, det, e);
+    // sr with the rf prefix stripped (keeping the leading '/'), only when
+    // sr really lies under rf.
+    var store_under: ?[]const u8 = null;
+    if (std.mem.startsWith(u8, sr, rf) and
+        (rf.len == 1 or (sr.len > rf.len and sr[rf.len] == '/')))
+        store_under = if (rf.len == 1) sr else sr[rf.len..];
+
+    var stack: std.ArrayList([]const u8) = .empty;
+    for (roots.items) |root| {
+        if (dir_is_store(store_under, root)) continue;
+        stack.clearRetainingCapacity();
+        stack.append(a, root) catch return e.set("out of memory", .{});
+        while (stack.pop()) |dir| {
+            var pb2: [2 * st.FX_PATH_MAX]u8 = undefined;
+            const full_dir = std.fmt.bufPrint(&pb2, "{s}{s}", .{ rf, dir }) catch continue;
+            var dirh = Io.Dir.cwd().openDir(io, full_dir, .{ .iterate = true }) catch continue;
+            defer dirh.close(io);
+            var it = dirh.iterate();
+            while (it.next(io) catch null) |ent| {
+                var cb: [2 * st.FX_PATH_MAX]u8 = undefined;
+                const child = std.fmt.bufPrint(&cb, "{s}/{s}", .{ dir, ent.name }) catch continue;
+                switch (ent.kind) {
+                    .directory => {
+                        if (dir_is_store(store_under, child)) continue;
+                        const owned = a.dupe(u8, child) catch return e.set("out of memory", .{});
+                        stack.append(a, owned) catch return e.set("out of memory", .{});
+                    },
+                    .file, .sym_link => {
+                        if (in_names(targets.items, child)) continue;
+                        var tb: [2 * st.FX_PATH_MAX]u8 = undefined;
+                        const det = std.fmt.bufPrint(&tb, "present under {s} but no install fact records it (as-of version {d})", .{ dir, ver }) catch "unmanaged";
+                        try add_drift(out, child, .unmanaged, det, e);
+                    },
+                    else => {}, // fifo/socket/device/unknown: not drift candidates
+                }
+            }
         }
     }
 }
@@ -1166,20 +1215,31 @@ test "prov_verify: drift taxonomy + clean rootfs + old-snapshot absent-as-empty"
     try testing.expectEqual(@as(usize, 0), drifts.items.len);
 
     // tamper: missing /etc/hosts, wrong mode on /etc/motd, repointed
-    // /bin/world, and two unmanaged strays
+    // /bin/world, and unmanaged strays — immediate AND below a subdir of
+    // an owned root (the recursive scan), plus a symlink-to-dir that must
+    // be flagged itself, never descended into (no cycle).
     Io.Dir.cwd().deleteFile(io, hosts) catch {};
     Io.Dir.cwd().setFilePermissions(io, motd, Io.File.Permissions.fromMode(0o777), .{}) catch {};
     Io.Dir.cwd().deleteFile(io, link_world) catch {};
     try Io.Dir.cwd().symLink(io, "/nowhere", link_world, .{});
     var f3: [128:0]u8 = undefined;
     var f4: [128:0]u8 = undefined;
+    var f5: [128:0]u8 = undefined;
+    var f6: [128:0]u8 = undefined;
     const rogue = try std.fmt.bufPrintZ(&f3, "{s}/bin/rogue", .{rootfs});
     const stray = try std.fmt.bufPrintZ(&f4, "{s}/etc/stray", .{rootfs});
+    const nested_dir = try std.fmt.bufPrintZ(&f5, "{s}/etc/nested", .{rootfs});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rogue, .data = "x" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = stray, .data = "y" });
+    try Io.Dir.cwd().createDirPath(io, nested_dir); // dirs are never drift
+    const deep = try std.fmt.bufPrintZ(&f6, "{s}/nested/deep", .{etc_dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = deep, .data = "z" });
+    var l3: [128:0]u8 = undefined;
+    const loop = try std.fmt.bufPrintZ(&l3, "{s}/nested/loop", .{etc_dir});
+    try Io.Dir.cwd().symLink(io, "/etc", loop, .{});
 
     try prov_verify(io, db, rootfs, store, .current, &e, &drifts);
-    try testing.expectEqual(@as(usize, 5), drifts.items.len);
+    try testing.expectEqual(@as(usize, 7), drifts.items.len);
 
     var seen_missing: usize = 0;
     var seen_mode: usize = 0;
@@ -1205,7 +1265,9 @@ test "prov_verify: drift taxonomy + clean rootfs + old-snapshot absent-as-empty"
             .unmanaged => {
                 seen_unmanaged += 1;
                 try testing.expect(std.mem.eql(u8, dr.target, "/bin/rogue") or
-                    std.mem.eql(u8, dr.target, "/etc/stray"));
+                    std.mem.eql(u8, dr.target, "/etc/stray") or
+                    std.mem.eql(u8, dr.target, "/etc/nested/deep") or
+                    std.mem.eql(u8, dr.target, "/etc/nested/loop"));
             },
             .hash => return error.UnexpectedHashDrift, // impossible here: this fixture has no store-side etc origins (the skip rule)
         }
@@ -1213,7 +1275,7 @@ test "prov_verify: drift taxonomy + clean rootfs + old-snapshot absent-as-empty"
     try testing.expectEqual(@as(usize, 1), seen_missing);
     try testing.expectEqual(@as(usize, 1), seen_mode);
     try testing.expectEqual(@as(usize, 1), seen_link);
-    try testing.expectEqual(@as(usize, 2), seen_unmanaged);
+    try testing.expectEqual(@as(usize, 4), seen_unmanaged);
 
     // never-published version
     e = .{};
