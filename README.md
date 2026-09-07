@@ -26,7 +26,8 @@ Nix-like, but-specified-in-Dhall system.
   renamed to the final path, and *then* the metadata transaction commits
   (metadata-last: a crash leaves a reapable orphan dir, never dangling metadata).
 - **Time travel, native** — `datalog-dafsa` versioned snapshots + as-of queries
-  are available for timeline / rollback (future work).
+  are available for timeline / rollback; `fx_store_rollback` is
+  snapshot-complete (restores every relation as-of the target version).
 
 See the [fixpoint-linux design](https://github.com/fixpoint-linux/fixpoint-linux/blob/main/DESIGN.md).
 
