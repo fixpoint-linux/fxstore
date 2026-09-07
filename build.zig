@@ -139,6 +139,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "closure", .module = closure_mod },
             .{ .name = "store", .module = store_mod },
             .{ .name = "build", .module = build_mod },
+            .{ .name = "provenance", .module = prov_mod },
         },
     });
     linkDatalog(b, main_mod);

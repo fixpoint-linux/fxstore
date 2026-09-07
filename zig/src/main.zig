@@ -11,6 +11,13 @@
 //   fxstore rollback [--hard] <v> [--store DIR]
 //                                       roll the store back to snapshot version <v>
 //                                       (default roll-forward; --hard repoints CURRENT)
+//   fxstore what <target> [--as-of N] [--store DIR]
+//                                       show the install fact managing <target>
+//   fxstore why <pkg> [--as-of N] [--store DIR]
+//                                       show why <pkg> is in the store
+//   fxstore verify [<rootfs>] [--as-of N] [--store DIR]
+//                                       reconcile <rootfs> against the recorded
+//                                       install facts; report drift
 //
 // Glue over the five ported units: package-set walker (packageset.zig),
 // canonical serializer + sha256 store path (derivation.zig), datalog closure
@@ -38,6 +45,7 @@ const drv = @import("derivation");
 const cl = @import("closure");
 const st = @import("store");
 const bld = @import("build");
+const prov = @import("provenance");
 
 const Package = pkgs.Package;
 const PackageSet = pkgs.PackageSet;
@@ -135,11 +143,23 @@ pub fn usage(fd: c_int) void {
             "  fxstore rollback [--hard] <v> [--store DIR]\n" ++
             "                                          roll the store back to snapshot version <v>\n" ++
             "                                          (default roll-forward; --hard repoints CURRENT)\n" ++
+            "  fxstore what <target> [--as-of N] [--store DIR]\n" ++
+            "                                          show the install fact managing <target>\n" ++
+            "                                          (the provenance proof tree)\n" ++
+            "  fxstore why <pkg> [--as-of N] [--store DIR]\n" ++
+            "                                          show why <pkg> is in the store (its closure,\n" ++
+            "                                          provided targets, pulling roots)\n" ++
+            "  fxstore verify [<rootfs>] [--as-of N] [--store DIR]\n" ++
+            "                                          reconcile <rootfs> (default /) against the\n" ++
+            "                                          recorded install facts; exit 1 on drift\n" ++
             "options:\n" ++
             "  --store DIR   store root (default: {s})\n" ++
             "  --retain N    (gc) keep the N most-recent snapshot versions, prune the rest\n" ++
             "  -n N          same as --retain N\n" ++
             "  --hard        (rollback) recovery-only: repoint CURRENT directly at <v>, no new version\n" ++
+            "  --as-of N     (what/why/verify) read snapshot version N instead of the newest published\n" ++
+            "                (a manual rollback does not re-publish — use --as-of to read the\n" ++
+            "                rolled-back activation facts)\n" ++
             "  -h, --help    show this help\n" ++
             "build/query load \"package-set.dhall\" from the current directory.\n",
         .{DEFAULT_STORE_ROOT},
@@ -157,6 +177,8 @@ pub const CliArgs = struct {
     hard: bool = false, // --hard (rollback)
     retain: u32 = 0, // --retain N / -n N (gc)
     has_retain: bool = false, // --retain was given
+    as_of: u32 = 0, // --as-of N (what/why/verify)
+    has_as_of: bool = false, // --as-of was given
 };
 
 /// Parse argv[start..].  Strips --store DIR / --store=DIR and -h/--help.
@@ -199,6 +221,22 @@ pub fn parse_args(argv: []const []const u8, start: usize, c: *CliArgs) i32 {
                 cli_free(c);
                 return -1;
             }
+        } else if (std.mem.eql(u8, a, "--as-of")) {
+            if (i + 1 >= argv.len) {
+                err_print("fxstore: --as-of requires a version argument\n", .{});
+                cli_free(c);
+                return -1;
+            }
+            i += 1;
+            if (!parse_as_of(argv[i], c)) {
+                cli_free(c);
+                return -1;
+            }
+        } else if (std.mem.startsWith(u8, a, "--as-of=")) {
+            if (!parse_as_of(a[8..], c)) {
+                cli_free(c);
+                return -1;
+            }
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             usage(g_out_fd);
             cli_free(c);
@@ -227,6 +265,26 @@ fn parse_retain(val: []const u8, c: *CliArgs) bool {
     }
     c.retain = @intCast(n);
     c.has_retain = true;
+    return true;
+}
+
+/// The --as-of counterpart of parse_retain (rollback's version validation):
+/// reject trailing garbage, non-positive versions, and versions above
+/// 4294967295 (the snapshot-version range).
+fn parse_as_of(val: []const u8, c: *CliArgs) bool {
+    const zv = c_alloc.dupeZ(u8, val) catch {
+        err_print("fxstore: out of memory\n", .{});
+        return false;
+    };
+    defer c_alloc.free(zv);
+    var end: [*:0]u8 = undefined;
+    const n = strtol(zv.ptr, &end, 10);
+    if (end[0] != 0 or n <= 0 or @as(u64, @bitCast(n)) > 0xFFFFFFFF) {
+        err_print("fxstore: invalid --as-of version '{s}' (expected an integer in 1..4294967295)\n", .{val});
+        return false;
+    }
+    c.as_of = @intCast(n);
+    c.has_as_of = true;
     return true;
 }
 
@@ -585,6 +643,120 @@ fn cmd_rollback(io: Io, argv: []const []const u8, start: usize) u8 {
     return 0;
 }
 
+// ─── what/why/verify: the store-honest provenance debug view (the thin CLI
+// ─── over provenance.zig; the engine owns every semantic) ───────────────────
+
+/// The Version a --as-of flag selects (CURRENT = newest published when absent).
+fn prov_version(c: *const CliArgs) prov.Version {
+    return if (c.has_as_of) .{ .as_of = c.as_of } else .current;
+}
+
+/// Open the store for a read-only prov command (the cmd_query open idiom).
+fn prov_open(io: Io, store_root: []const u8) ?*st.Store {
+    var serr = st.ErrBuf{};
+    const s = st.fx_store_open(io, store_root, &serr) catch {
+        err_print("fxstore: {s}\n", .{serr.slice()});
+        return null;
+    };
+    return s;
+}
+
+fn cmd_what(io: Io, argv: []const []const u8, start: usize) u8 {
+    var c = CliArgs{};
+    const pr = parse_args(argv, start, &c);
+    if (pr != 0) return if (pr == 1) 0 else 2;
+    defer cli_free(&c);
+    if (c.npos != 1) {
+        err_print("fxstore: what requires exactly one target path\n\n", .{});
+        usage(g_err_fd);
+        return 2;
+    }
+    const store_root = c.store_root orelse DEFAULT_STORE_ROOT;
+
+    const s = prov_open(io, store_root) orelse return 1;
+    defer st.fx_store_close(s);
+
+    var e = prov.ProvErrBuf{};
+    const r = prov.prov_what(st.fx_store_db(s), c.pos[0], prov_version(&c), &e) catch {
+        err_print("fxstore: {s}\n", .{e.slice()});
+        return 1;
+    };
+    defer prov.prov_free_what(r);
+
+    var aw: Io.Writer.Allocating = .init(c_alloc);
+    defer aw.deinit();
+    prov.prov_render_what(&aw.writer, &r) catch return 1;
+    const out = aw.written();
+    _ = write(g_out_fd, out.ptr, out.len);
+    return 0;
+}
+
+fn cmd_why(io: Io, argv: []const []const u8, start: usize) u8 {
+    var c = CliArgs{};
+    const pr = parse_args(argv, start, &c);
+    if (pr != 0) return if (pr == 1) 0 else 2;
+    defer cli_free(&c);
+    if (c.npos != 1) {
+        err_print("fxstore: why requires exactly one package name\n\n", .{});
+        usage(g_err_fd);
+        return 2;
+    }
+    const store_root = c.store_root orelse DEFAULT_STORE_ROOT;
+
+    const s = prov_open(io, store_root) orelse return 1;
+    defer st.fx_store_close(s);
+
+    var e = prov.ProvErrBuf{};
+    const r = prov.prov_why(st.fx_store_db(s), c.pos[0], prov_version(&c), &e) catch {
+        err_print("fxstore: {s}\n", .{e.slice()});
+        return 1;
+    };
+    defer prov.prov_free_why(r);
+
+    var aw: Io.Writer.Allocating = .init(c_alloc);
+    defer aw.deinit();
+    prov.prov_render_why(&aw.writer, &r) catch return 1;
+    const out = aw.written();
+    _ = write(g_out_fd, out.ptr, out.len);
+    return 0;
+}
+
+fn cmd_verify(io: Io, argv: []const []const u8, start: usize) u8 {
+    var c = CliArgs{};
+    const pr = parse_args(argv, start, &c);
+    if (pr != 0) return if (pr == 1) 0 else 2;
+    defer cli_free(&c);
+    if (c.npos > 1) {
+        err_print("fxstore: verify takes at most one rootfs path\n\n", .{});
+        usage(g_err_fd);
+        return 2;
+    }
+    const rootfs: []const u8 = if (c.npos == 1) c.pos[0] else "/";
+    const store_root = c.store_root orelse DEFAULT_STORE_ROOT;
+
+    const s = prov_open(io, store_root) orelse return 1;
+    defer st.fx_store_close(s);
+
+    // the drift strings are c_alloc-owned (prov_free_drifts); the list
+    // STORAGE is ours (deinit(c_alloc)).
+    var drifts: std.ArrayList(prov.Drift) = .empty;
+    defer drifts.deinit(c_alloc);
+    defer prov.prov_free_drifts(drifts.items);
+
+    var e = prov.ProvErrBuf{};
+    prov.prov_verify(io, st.fx_store_db(s), rootfs, store_root, prov_version(&c), &e, &drifts) catch {
+        err_print("fxstore: {s}\n", .{e.slice()});
+        return 1;
+    };
+
+    out_print("fxstore: verify {s} against store {s}: {d} drift(s)\n", .{ rootfs, store_root, drifts.items.len });
+    for (drifts.items) |dr|
+        out_print("{s}: {s}: {s}\n", .{ dr.target, @tagName(dr.kind), dr.detail });
+    if (drifts.items.len > 0) return 1;
+    out_print("fxstore: verify OK\n", .{});
+    return 0;
+}
+
 // ─── init: scaffold a worked-example project (main.c:520-624) ───────────────
 
 /// mkdir_if_missing (main.c:522-527): mkdir(0755); EEXIST + is-dir is OK.
@@ -764,6 +936,12 @@ pub fn main(init: std.process.Init) !void {
         rc = cmd_timeline(io, args, 2);
     } else if (std.mem.eql(u8, cmd.?, "rollback")) {
         rc = cmd_rollback(io, args, 2);
+    } else if (std.mem.eql(u8, cmd.?, "what")) {
+        rc = cmd_what(io, args, 2);
+    } else if (std.mem.eql(u8, cmd.?, "why")) {
+        rc = cmd_why(io, args, 2);
+    } else if (std.mem.eql(u8, cmd.?, "verify")) {
+        rc = cmd_verify(io, args, 2);
     } else {
         err_print("fxstore: unknown command '{s}'\n\n", .{cmd.?});
         usage(g_err_fd);
@@ -989,6 +1167,63 @@ test "parse_args: invalid retain values -> -1 + exact stderr" {
     var c2 = CliArgs{};
     try testing.expectEqual(@as(i32, 0), parse_args(&.{ "gc", "--retain", "1" }, 1, &c2));
     cli_free(&c2);
+}
+
+test "parse_args: --as-of N / --as-of= forms (what/why/verify)" {
+    var c = CliArgs{};
+    const rc = parse_args(&.{ "what", "--as-of", "7", "/bin/hello" }, 1, &c);
+    try testing.expectEqual(@as(i32, 0), rc);
+    defer cli_free(&c);
+    try testing.expect(c.has_as_of);
+    try testing.expectEqual(@as(u32, 7), c.as_of);
+    try testing.expectEqual(@as(usize, 1), c.npos);
+    try testing.expectEqualStrings("/bin/hello", c.pos[0]);
+
+    var c2 = CliArgs{};
+    try testing.expectEqual(@as(i32, 0), parse_args(&.{ "why", "--as-of=42", "hello" }, 1, &c2));
+    defer cli_free(&c2);
+    try testing.expect(c2.has_as_of);
+    try testing.expectEqual(@as(u32, 42), c2.as_of);
+
+    // the boundary values behave like rollback's version parse
+    var c3 = CliArgs{};
+    try testing.expectEqual(@as(i32, 0), parse_args(&.{ "verify", "--as-of=4294967295" }, 1, &c3));
+    cli_free(&c3);
+}
+
+test "parse_args: --as-of errors -> -1 + exact stderr" {
+    // missing value
+    {
+        var cap = try Capture.begin("/tmp/fx-u9-ao-out", "/tmp/fx-u9-ao-err");
+        cap.redirect();
+        var c = CliArgs{};
+        const rc = parse_args(&.{ "what", "--as-of" }, 1, &c);
+        const out_bytes = try cap.end();
+        defer testing.allocator.free(out_bytes);
+        const err_bytes = try cap.end_err();
+        defer testing.allocator.free(err_bytes);
+        try testing.expectEqual(@as(i32, -1), rc);
+        try testing.expectEqualStrings(
+            "fxstore: --as-of requires a version argument\n",
+            err_bytes,
+        );
+    }
+    // invalid values (trailing garbage, zero, negative, out of range)
+    const bad = [_][]const u8{ "abc", "0", "-3", "4294967296", "12x", "" };
+    for (bad) |v| {
+        var cap = try Capture.begin("/tmp/fx-u9-aob-out", "/tmp/fx-u9-aob-err");
+        cap.redirect();
+        var c = CliArgs{};
+        const rc = parse_args(&.{ "why", "--as-of", v, "hello" }, 1, &c);
+        const out_bytes = try cap.end();
+        defer testing.allocator.free(out_bytes);
+        const err_bytes = try cap.end_err();
+        defer testing.allocator.free(err_bytes);
+        try testing.expectEqual(@as(i32, -1), rc);
+        const want = try std.fmt.allocPrint(testing.allocator, "fxstore: invalid --as-of version '{s}' (expected an integer in 1..4294967295)\n", .{v});
+        defer testing.allocator.free(want);
+        try testing.expectEqualStrings(want, err_bytes);
+    }
 }
 
 test "parse_args: -h/--help -> 1 with usage on stdout, positionals collected" {

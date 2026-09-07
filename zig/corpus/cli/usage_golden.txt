@@ -11,10 +11,22 @@ usage:
   fxstore rollback [--hard] <v> [--store DIR]
                                           roll the store back to snapshot version <v>
                                           (default roll-forward; --hard repoints CURRENT)
+  fxstore what <target> [--as-of N] [--store DIR]
+                                          show the install fact managing <target>
+                                          (the provenance proof tree)
+  fxstore why <pkg> [--as-of N] [--store DIR]
+                                          show why <pkg> is in the store (its closure,
+                                          provided targets, pulling roots)
+  fxstore verify [<rootfs>] [--as-of N] [--store DIR]
+                                          reconcile <rootfs> (default /) against the
+                                          recorded install facts; exit 1 on drift
 options:
   --store DIR   store root (default: /fx/store)
   --retain N    (gc) keep the N most-recent snapshot versions, prune the rest
   -n N          same as --retain N
   --hard        (rollback) recovery-only: repoint CURRENT directly at <v>, no new version
+  --as-of N     (what/why/verify) read snapshot version N instead of the newest published
+                (a manual rollback does not re-publish — use --as-of to read the
+                rolled-back activation facts)
   -h, --help    show this help
 build/query load "package-set.dhall" from the current directory.
