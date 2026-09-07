@@ -77,6 +77,7 @@ pub const ErrBuf = struct {
 
 /// dl.h dl_tuple_cb: return non-zero to stop enumeration early.
 const dl_tuple_cb = *const fn (cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int;
+const dl_relation_cb = *const fn (name: [*:0]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int;
 
 pub extern fn dl_lookup(db: *DlDb, rel: [*:0]const u8, cols: [*]const u32, arity: u8) c_int;
 pub extern fn dl_txn_begin(db: *DlDb) c_int;
@@ -86,6 +87,10 @@ pub extern fn dl_txn_commit(db: *DlDb) c_int;
 pub extern fn dl_txn_rollback(db: *DlDb) c_int;
 pub extern fn dl_snapshot_versions(db: *const DlDb, out: ?[*]u32, cap: usize) c_long;
 pub extern fn dl_query_version(db: *DlDb, version: u32, goal_rel: [*:0]const u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
+/// The one LIVE-state reader (dl.h CAVEAT: dl_query/dl_iter prefer the
+/// published snapshot; dl_prefix always reads the WAL-replayed relation).
+pub extern fn dl_prefix(db: *const DlDb, rel: [*:0]const u8, leading: ?[*]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
+pub extern fn dl_snapshot_relations(db: *DlDb, version: u32, cb: dl_relation_cb, user: ?*anyopaque) c_long;
 pub extern fn dl_set_snapshot_retain(db: *DlDb, n: c_uint) c_int;
 
 // ─── constants + libc surface (fxstore.h:182-197; the build.zig externs) ───
@@ -872,12 +877,16 @@ const RawBag = struct {
     tuples: std.ArrayList(u32) = .empty, // arity * n values
     n: usize = 0,
     arity: u8 = 0,
+    oom: bool = false, // raw_cb stopped early on allocation failure
 };
 
 fn raw_cb(cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     const bag: *RawBag = @ptrCast(@alignCast(user.?));
     bag.arity = arity;
-    bag.tuples.appendSlice(c_alloc, cols[0..arity]) catch return 1; // OOM: stop
+    bag.tuples.appendSlice(c_alloc, cols[0..arity]) catch {
+        bag.oom = true;
+        return 1; // OOM: stop
+    };
     bag.n += 1;
     return 0;
 }
@@ -926,6 +935,91 @@ fn txn_add_bag(db: *DlDb, rel: [*:0]const u8, bag: *const RawBag) c_int {
             return -1;
     }
     return 0;
+}
+
+/// One fixed-arity relation as recorded in a snapshot manifest (name owned
+/// by the caller's arena).
+const RelInfo = struct {
+    name: [:0]u8,
+    arity: u8,
+    idb: bool,
+};
+
+/// dl_relation_cb receiver: collects a dl_snapshot_relations enumeration.
+const RelEnumCtx = struct {
+    a: std.mem.Allocator,
+    rels: std.ArrayList(RelInfo) = .empty,
+    failed: bool = false,
+
+    fn cb(name: [*:0]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int {
+        const self: *RelEnumCtx = @ptrCast(@alignCast(user.?));
+        const dup = self.a.dupeZ(u8, std.mem.span(name)) catch {
+            self.failed = true;
+            return 1;
+        };
+        self.rels.append(self.a, .{ .name = dup, .arity = arity, .idb = idb != 0 }) catch {
+            self.a.free(dup);
+            self.failed = true;
+            return 1;
+        };
+        return 0;
+    }
+};
+
+/// Enumerate the fixed-arity relations of snapshot `version`'s manifest.
+fn snapshot_rels(db: *DlDb, version: u32, a: std.mem.Allocator, e: *ErrBuf) Error![]RelInfo {
+    var ctx = RelEnumCtx{ .a = a };
+    if (dl_snapshot_relations(db, version, RelEnumCtx.cb, &ctx) < 0 or ctx.failed)
+        return e.set("cannot enumerate relations of snapshot {d}", .{version});
+    return ctx.rels.items;
+}
+
+/// The snapshot-complete rollback swap set: the union of the fixed-arity
+/// relations in `version`'s and `live`'s manifests, minus what the swap must
+/// NOT touch — IDB-flagged entries in EITHER manifest (derived data,
+/// data-driven: 'closure' today, re-computed by fx_closure_rebuild after the
+/// swap; a future IDB relation outside that program would linger stale) and
+/// the reserved 'rev' CAS relation (dl_txn_add/delete_fact reject it).
+/// A relation only in `version`'s manifest is declared fresh and repopulated;
+/// one only in `live`'s is cleared to empty (absent-as-empty).  An arity
+/// disagreement across the two manifests is a hard error: rolling back
+/// across a schema change would corrupt the swap.
+fn rollback_swap_rels(
+    db: *DlDb,
+    version: u32,
+    live: u32,
+    a: std.mem.Allocator,
+    e: *ErrBuf,
+) Error![]RelInfo {
+    const rels_v = try snapshot_rels(db, version, a, e);
+    const rels_live = try snapshot_rels(db, live, a, e);
+
+    var merged: std.ArrayList(RelInfo) = .empty;
+    for (rels_v) |r|
+        merged.append(a, r) catch return e.set("out of memory", .{});
+    for (rels_live) |lr| {
+        for (merged.items) |*m| {
+            if (std.mem.eql(u8, m.name, lr.name)) {
+                if (m.arity != lr.arity)
+                    return e.set(
+                        "relation '{s}' is arity {d} in snapshot {d} but {d} in snapshot {d} — cannot roll back across a schema change",
+                        .{ m.name, m.arity, version, lr.arity, live },
+                    );
+                m.idb = m.idb or lr.idb;
+                break;
+            }
+        } else {
+            merged.append(a, lr) catch return e.set("out of memory", .{});
+        }
+    }
+
+    var out: std.ArrayList(RelInfo) = .empty;
+    for (merged.items) |m| {
+        if (m.idb) continue; // re-derived after the swap, never copied
+        if (std.mem.eql(u8, m.name, "rev")) continue; // CAS system relation
+        out.append(a, m) catch return e.set("out of memory", .{});
+    }
+    return out.items;
 }
 
 /// Read the CURRENT snapshot version: best-effort parse of
@@ -1084,10 +1178,11 @@ fn write_current(s: *Store, version: u32, e: *ErrBuf) Error!void {
 ///     `version`; no new version, no fact mutation.
 ///   soft (roll-forward, default): publish the current state FIRST (so
 ///     un-published facts fold into a version and pre-rollback state is
-///     preserved as an undoable version), then in ONE atomic txn replace
-///     every current store/srcstore/pkg/dep/root fact with `version`'s,
-///     then re-derive `closure` via fx_closure_rebuild (publishing the
-///     rollback result — two new versions, CURRENT advances monotonically).
+///     preserved as an undoable version), then in ONE atomic txn restore
+///     EVERY relation to `version` — the restorable set enumerated from the
+///     version's manifest, not a hardcoded name list — then re-derive
+///     `closure` via fx_closure_rebuild (publishing the rollback result —
+///     two new versions, CURRENT advances monotonically).
 pub fn fx_store_rollback(s: ?*Store, version: u32, hard: bool, e: *ErrBuf) Error!void {
     const st = s orelse return e.set("internal: null store", .{});
 
@@ -1123,82 +1218,75 @@ pub fn fx_store_rollback(s: ?*Store, version: u32, hard: bool, e: *ErrBuf) Error
     if (cl.dl_publish_snapshot(st.db) != 0)
         return e.set("cannot publish store snapshot before rollback", .{});
 
-    // 2. read `version`'s store/srcstore/pkg/dep/root facts (NOT closure —
-    // an IDB re-derived below).  srcstore is optional (old snapshots predate
-    // the clean-source work).
-    var vstore: RawBag = .{};
-    var vsrcstore: RawBag = .{};
-    var vpkg: RawBag = .{};
-    var vdep: RawBag = .{};
-    var vroot: RawBag = .{};
-    defer {
-        rawbag_free(&vstore);
-        rawbag_free(&vsrcstore);
-        rawbag_free(&vpkg);
-        rawbag_free(&vdep);
-        rawbag_free(&vroot);
-    }
-    try version_bag(st.db, version, "store", false, &vstore, e);
-    try version_bag(st.db, version, "srcstore", true, &vsrcstore, e);
-    try version_bag(st.db, version, "pkg", true, &vpkg, e);
-    try version_bag(st.db, version, "dep", true, &vdep, e);
-    try version_bag(st.db, version, "root", true, &vroot, e);
-
-    // 3. enumerate the CURRENT (== just-published latest) facts to delete.
+    // 2. resolve the swap set from BOTH manifests (the target `version`'s
+    //    and the just-published live one) — snapshot-complete: every
+    //    restorable relation the recorded schema names, not a hardcoded
+    //    subset.  IDB rels ('closure') and reserved 'rev' are excluded.
     const total2 = dl_snapshot_versions(st.db, null, 0);
     if (total2 <= 0)
         return e.set("no published snapshot after rollback publish", .{});
     const vers2 = a.alloc(u32, @intCast(total2)) catch return e.set("out of memory", .{});
     _ = dl_snapshot_versions(st.db, vers2.ptr, @intCast(total2));
     const live_v = vers2[@as(usize, @intCast(total2)) - 1];
+    const swap = try rollback_swap_rels(st.db, version, live_v, a, e);
 
-    var curstore: RawBag = .{};
-    var cursrcstore: RawBag = .{};
-    var curpkg: RawBag = .{};
-    var curdep: RawBag = .{};
-    var curroot: RawBag = .{};
+    // 3. keep `version`'s pkg/dep/root bags aside: the swap restores them
+    //    like any other relation, and fx_closure_rebuild then re-derives the
+    //    fixpoint from exactly these facts (NOT closure — an IDB excluded
+    //    from the swap set above).
+    var vpkg: RawBag = .{};
+    var vdep: RawBag = .{};
+    var vroot: RawBag = .{};
     defer {
-        rawbag_free(&curstore);
-        rawbag_free(&cursrcstore);
-        rawbag_free(&curpkg);
-        rawbag_free(&curdep);
-        rawbag_free(&curroot);
+        rawbag_free(&vpkg);
+        rawbag_free(&vdep);
+        rawbag_free(&vroot);
     }
-    try version_bag(st.db, live_v, "store", false, &curstore, e);
-    try version_bag(st.db, live_v, "srcstore", true, &cursrcstore, e);
-    try version_bag(st.db, live_v, "pkg", true, &curpkg, e);
-    try version_bag(st.db, live_v, "dep", true, &curdep, e);
-    try version_bag(st.db, live_v, "root", true, &curroot, e);
+    try version_bag(st.db, version, "pkg", true, &vpkg, e);
+    try version_bag(st.db, version, "dep", true, &vdep, e);
+    try version_bag(st.db, version, "root", true, &vroot, e);
 
-    // 4. declare the swap relations idempotently — guarantees the txn
-    // add/delete succeed even on a freshly re-opened db whose relation
-    // schema is in-memory only (fx_store_open declares store/srcstore;
-    // pkg/dep/root are normally declared by fx_closure_compute).
-    if (cl.dl_declare_relation(st.db, "store", 2) != 0 or
-        cl.dl_declare_relation(st.db, "srcstore", 2) != 0 or
-        cl.dl_declare_relation(st.db, "pkg", 1) != 0 or
-        cl.dl_declare_relation(st.db, "dep", 2) != 0 or
-        cl.dl_declare_relation(st.db, "root", 1) != 0)
-    {
-        return e.set("cannot declare relations for rollback", .{});
+    // 4. declare every swap relation idempotently — guarantees the txn
+    //    add/delete succeed even for relations that exist only in `version`'s
+    //    manifest and were never declared live (e.g. after a re-init).
+    for (swap) |rel| {
+        if (cl.dl_declare_relation(st.db, rel.name.ptr, rel.arity) != 0)
+            return e.set("cannot declare relation '{s}' for rollback", .{rel.name});
     }
 
-    // 5. ONE atomic txn: delete every current fact, add every `version`
-    // fact (the atomic index+EDB switch; one WAL + one fsync).
+    // 5. ONE atomic txn, per relation: delete every LIVE fact (dl_prefix —
+    //    the one live-WAL reader, so the clear targets exactly the state
+    //    txn_delete_fact mutates; the publish above did not change the
+    //    in-memory relations), then add `version`'s facts (allow_absent: a
+    //    relation missing from `version`'s manifest reads as empty, i.e.
+    //    cleared-to-empty).  One WAL + one fsync for the whole swap.
     if (dl_txn_begin(st.db) != 0)
         return e.set("txn begin failed (another txn open?)", .{});
-    if (txn_delete_bag(st.db, "store", &curstore) != 0 or
-        txn_delete_bag(st.db, "srcstore", &cursrcstore) != 0 or
-        txn_delete_bag(st.db, "pkg", &curpkg) != 0 or
-        txn_delete_bag(st.db, "dep", &curdep) != 0 or
-        txn_delete_bag(st.db, "root", &curroot) != 0 or
-        txn_add_bag(st.db, "store", &vstore) != 0 or
-        txn_add_bag(st.db, "srcstore", &vsrcstore) != 0 or
-        txn_add_bag(st.db, "pkg", &vpkg) != 0 or
-        txn_add_bag(st.db, "dep", &vdep) != 0 or
-        txn_add_bag(st.db, "root", &vroot) != 0 or
-        dl_txn_commit(st.db) != 0)
-    {
+    var txn_failed = false;
+    for (swap) |rel| {
+        var live_bag: RawBag = .{};
+        defer rawbag_free(&live_bag);
+        var vb: RawBag = .{};
+        defer rawbag_free(&vb);
+
+        const n_live = dl_prefix(st.db, rel.name.ptr, null, 0, raw_cb, &live_bag);
+        if (n_live < 0 or live_bag.oom) {
+            txn_failed = true;
+            break;
+        }
+        version_bag(st.db, version, rel.name.ptr, true, &vb, e) catch {
+            txn_failed = true;
+            break;
+        };
+        if (vb.oom or
+            txn_delete_bag(st.db, rel.name.ptr, &live_bag) != 0 or
+            txn_add_bag(st.db, rel.name.ptr, &vb) != 0)
+        {
+            txn_failed = true;
+            break;
+        }
+    }
+    if (txn_failed or dl_txn_commit(st.db) != 0) {
         _ = dl_txn_rollback(st.db);
         return e.set("rollback metadata txn failed", .{});
     }
@@ -2025,6 +2113,275 @@ test "fx_store_rollback: roll-forward restores facts + re-derives closure; hard 
     defer fx_store_close(s2);
     try testing.expectError(error.FxStore, fx_store_rollback(s2, 1, false, &e));
     try testing.expectEqualStrings("no published snapshot in the store db — run a build first", e.slice());
+}
+
+// ─── ported U4: snapshot-complete rollback over install/provides/boot_grace ──
+
+/// Collect the LIVE (WAL-replayed) tuples of `rel` via dl_prefix — the one
+/// reader that ignores the pinned snapshot (dl.h CAVEAT: dl_query/dl_iter
+/// prefer the newest published snapshot) — exactly what the rollback swap
+/// clears.  Test-only mirror of fx-init's U4 live_rows helper.
+const LiveRows = struct {
+    rows: [16][8]u32 = undefined,
+    n: usize = 0,
+
+    fn cb(cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+        const self: *LiveRows = @ptrCast(@alignCast(user.?));
+        if (self.n >= 16 or arity > 8) return 1;
+        var i: u8 = 0;
+        while (i < arity) : (i += 1) self.rows[self.n][i] = cols[i];
+        self.n += 1;
+        return 0;
+    }
+};
+
+fn live_rows(db: *DlDb, rel: [*:0]const u8) !LiveRows {
+    var out = LiveRows{};
+    const n = dl_prefix(db, rel, null, 0, LiveRows.cb, &out);
+    if (n < 0) return error.PrefixFailed;
+    return out;
+}
+
+fn sym_of(db: *DlDb, id: u32) []const u8 {
+    const p = cl.dl_intern_str_of(db, id) orelse "";
+    return std.mem.span(p);
+}
+
+fn str_lt(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Set-equality on canonicalized, sorted lines (expectEqualSlices compares
+/// slice ELEMENTS — pointer identity for strings, not bytes).
+fn expect_lines(expected: []const []const u8, actual: []const []const u8) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |x, a| try testing.expectEqualStrings(x, a);
+}
+
+test "fx_store_rollback: snapshot-complete swap restores every recorded relation (U4)" {
+    const io = tio();
+    var rb: [64:0]u8 = undefined;
+    const root = try temp_root(&rb);
+    defer cleanup_store(io, root);
+    var e = ErrBuf{};
+    const s = try fx_store_open(io, root, &e);
+    defer fx_store_close(s);
+    const db = s.db;
+
+    const ha = "a" ** 64;
+    const hb = "b" ** 64;
+    const hz = "c" ** 64;
+    const gen = "ef" ** 32;
+
+    // fixture fact writers — the activate.zig encoding (fx-init init.zig
+    // U4): symbol columns via dl_intern_str, mode/ms RAW u32 columns.
+    const F = struct {
+        fn install(d: *DlDb, target: [:0]const u8, origin: [:0]const u8, mode: u32, gh: [:0]const u8) !void {
+            const cols = [4]u32{ cl.dl_intern_str(d, target.ptr), cl.dl_intern_str(d, origin.ptr), mode, cl.dl_intern_str(d, gh.ptr) };
+            if (dl_txn_add_fact(d, "install", &cols, 4) != 0) return error.AddFact;
+        }
+        fn del_install(d: *DlDb, target: [:0]const u8, origin: [:0]const u8, mode: u32, gh: [:0]const u8) !void {
+            const cols = [4]u32{ cl.dl_intern_str(d, target.ptr), cl.dl_intern_str(d, origin.ptr), mode, cl.dl_intern_str(d, gh.ptr) };
+            if (dl_txn_delete_fact(d, "install", &cols, 4) != 0) return error.DelFact;
+        }
+        fn provides(d: *DlDb, pkg: [:0]const u8, sdir: [:0]const u8) !void {
+            const cols = [2]u32{ cl.dl_intern_str(d, pkg.ptr), cl.dl_intern_str(d, sdir.ptr) };
+            if (dl_txn_add_fact(d, "provides", &cols, 2) != 0) return error.AddFact;
+        }
+        fn del_provides(d: *DlDb, pkg: [:0]const u8, sdir: [:0]const u8) !void {
+            const cols = [2]u32{ cl.dl_intern_str(d, pkg.ptr), cl.dl_intern_str(d, sdir.ptr) };
+            if (dl_txn_delete_fact(d, "provides", &cols, 2) != 0) return error.DelFact;
+        }
+        fn boot_grace(d: *DlDb, ms: u32) !void {
+            const cols = [1]u32{ms}; // RAW u32 column
+            if (dl_txn_add_fact(d, "boot_grace", &cols, 1) != 0) return error.AddFact;
+        }
+        fn del_boot_grace(d: *DlDb, ms: u32) !void {
+            const cols = [1]u32{ms};
+            if (dl_txn_delete_fact(d, "boot_grace", &cols, 1) != 0) return error.DelFact;
+        }
+    };
+
+    // v1: a PRE-prov snapshot — boot_grace only, plus the minimal pkg/root
+    // EDB fx_closure_rebuild re-derives closure from.  install/provides are
+    // not even declared (the old-snapshot shape rollback must tolerate).
+    try testing.expectEqual(@as(c_int, 0), cl.dl_declare_relation(db, "boot_grace", 1));
+    try testing.expectEqual(@as(c_int, 0), cl.dl_declare_relation(db, "pkg", 1));
+    try testing.expectEqual(@as(c_int, 0), cl.dl_declare_relation(db, "dep", 2));
+    try testing.expectEqual(@as(c_int, 0), cl.dl_declare_relation(db, "root", 1));
+    {
+        try testing.expectEqual(@as(c_int, 0), dl_txn_begin(db));
+        try F.boot_grace(db, 30000);
+        const pkg_a = [1]u32{cl.dl_intern_str(db, "a")};
+        const pkg_b = [1]u32{cl.dl_intern_str(db, "b")};
+        const root_a = [1]u32{cl.dl_intern_str(db, "a")};
+        try testing.expectEqual(@as(c_int, 0), dl_txn_add_fact(db, "pkg", &pkg_a, 1));
+        try testing.expectEqual(@as(c_int, 0), dl_txn_add_fact(db, "pkg", &pkg_b, 1));
+        try testing.expectEqual(@as(c_int, 0), dl_txn_add_fact(db, "root", &root_a, 1));
+        try testing.expectEqual(@as(c_int, 0), dl_txn_commit(db));
+    }
+    try testing.expectEqual(@as(c_int, 0), cl.dl_publish_snapshot(db)); // v1
+
+    // v2: a good activation (install x2 / provides x2 / boot_grace 15000).
+    try testing.expectEqual(@as(c_int, 0), cl.dl_declare_relation(db, "install", 4));
+    try testing.expectEqual(@as(c_int, 0), cl.dl_declare_relation(db, "provides", 2));
+    {
+        try testing.expectEqual(@as(c_int, 0), dl_txn_begin(db));
+        try F.del_boot_grace(db, 30000);
+        try F.boot_grace(db, 15000);
+        try F.install(db, "/bin/hello", ha ++ "-hello", 0, gen);
+        try F.install(db, "/etc/motd", gen ++ "-system-generation/etc/motd", 0o644, gen);
+        try F.provides(db, "hello", ha ++ "-hello");
+        try F.provides(db, "world", hb ++ "-world");
+        try testing.expectEqual(@as(c_int, 0), dl_txn_commit(db));
+    }
+    try testing.expectEqual(@as(c_int, 0), cl.dl_publish_snapshot(db)); // v2
+
+    // v3: the failed activation — divergent facts under a different
+    // genhash, published (what production pins for the clear enumeration).
+    {
+        try testing.expectEqual(@as(c_int, 0), dl_txn_begin(db));
+        try F.del_install(db, "/bin/hello", ha ++ "-hello", 0, gen);
+        try F.del_install(db, "/etc/motd", gen ++ "-system-generation/etc/motd", 0o644, gen);
+        try F.del_provides(db, "hello", ha ++ "-hello");
+        try F.del_provides(db, "world", hb ++ "-world");
+        try F.del_boot_grace(db, 15000);
+        try F.install(db, "/bin/evil", hz ++ "-evil", 0, hz);
+        try F.provides(db, "evil", hz ++ "-evil");
+        try F.boot_grace(db, 9999);
+        try testing.expectEqual(@as(c_int, 0), dl_txn_commit(db));
+    }
+    try testing.expectEqual(@as(c_int, 0), cl.dl_publish_snapshot(db)); // v3
+    try testing.expectEqual(@as(c_long, 3), dl_snapshot_versions(db, null, 0));
+
+    // Live-set canonicalizer: install/provides/boot_grace rows to lines.
+    const Canon = struct {
+        db: *DlDb,
+        lines: [16][]const u8 = undefined,
+        bufs: [16][320]u8 = undefined,
+        n: usize = 0,
+
+        fn add(self: *@This(), comptime fmt: []const u8, args: anytype) void {
+            self.lines[self.n] = std.fmt.bufPrint(&self.bufs[self.n], fmt, args) catch unreachable;
+            self.n += 1;
+        }
+        fn install(self: *@This(), lr: LiveRows) void {
+            for (lr.rows[0..lr.n]) |r| self.add("{s}|{s}|0o{o}|{s}", .{
+                sym_of(self.db, r[0]), sym_of(self.db, r[1]), r[2], sym_of(self.db, r[3]),
+            });
+        }
+        fn provides(self: *@This(), lr: LiveRows) void {
+            for (lr.rows[0..lr.n]) |r| self.add("{s}|{s}", .{ sym_of(self.db, r[0]), sym_of(self.db, r[1]) });
+        }
+        fn boot_grace(self: *@This(), lr: LiveRows) void {
+            for (lr.rows[0..lr.n]) |r| self.add("{d}", .{r[0]});
+        }
+        fn sorted(self: *@This()) []const []const u8 {
+            std.mem.sort([]const u8, self.lines[0..self.n], {}, str_lt);
+            return self.lines[0..self.n];
+        }
+    };
+
+    const exp_install = [_][]const u8{
+        "/bin/hello|" ++ ha ++ "-hello|0o0|" ++ gen,
+        "/etc/motd|" ++ gen ++ "-system-generation/etc/motd|0o644|" ++ gen,
+    };
+    const exp_provides = [_][]const u8{
+        "hello|" ++ ha ++ "-hello",
+        "world|" ++ hb ++ "-world",
+    };
+
+    // arm (a) — THE gap fix: rollback to v2 restores install/provides
+    // exactly and clears v3's evil facts (live reads via dl_prefix).
+    try fx_store_rollback(s, 2, false, &e);
+    {
+        var c = Canon{ .db = db };
+        c.install(try live_rows(db, "install"));
+        try expect_lines(&exp_install, c.sorted());
+    }
+    {
+        var c = Canon{ .db = db };
+        c.provides(try live_rows(db, "provides"));
+        try expect_lines(&exp_provides, c.sorted());
+    }
+    {
+        var c = Canon{ .db = db };
+        c.boot_grace(try live_rows(db, "boot_grace"));
+        const exp = [_][]const u8{"15000"};
+        try expect_lines(&exp, c.sorted());
+    }
+    {
+        // closure re-derived from v2's restored pkg/dep/root EDB
+        var ce = cl.ErrBuf{};
+        const names = try cl.fx_closure_names(db, &ce);
+        defer cl.free_names(names);
+        try testing.expectEqual(@as(usize, 1), names.len); // root a (dep empty)
+    }
+
+    // arm (b) — the dl_prefix arm: a committed-but-UNPUBLISHED txn (crash
+    // between an activation's commit and its publish) leaves live tuples the
+    // newest snapshot lacks; the swap's live clear must still catch them
+    // (publish-first folds them into a version, dl_prefix clears them).
+    try testing.expectEqual(@as(c_int, 0), dl_txn_begin(db));
+    try F.del_install(db, "/bin/hello", ha ++ "-hello", 0, gen);
+    try F.install(db, "/bin/ghost", hz ++ "-ghost", 0, hz);
+    try F.del_provides(db, "world", hb ++ "-world");
+    try F.provides(db, "ghost", hz ++ "-ghost");
+    try F.del_boot_grace(db, 15000);
+    try F.boot_grace(db, 4242);
+    try testing.expectEqual(@as(c_int, 0), dl_txn_commit(db));
+    // deliberately NO publish before the rollback
+    try fx_store_rollback(s, 2, false, &e);
+    {
+        var c = Canon{ .db = db };
+        c.install(try live_rows(db, "install"));
+        try expect_lines(&exp_install, c.sorted());
+    }
+    {
+        var c = Canon{ .db = db };
+        c.provides(try live_rows(db, "provides"));
+        try expect_lines(&exp_provides, c.sorted());
+    }
+    {
+        var c = Canon{ .db = db };
+        c.boot_grace(try live_rows(db, "boot_grace"));
+        const exp = [_][]const u8{"15000"};
+        try expect_lines(&exp, c.sorted());
+    }
+
+    // arm (c) — rollback to the pre-prov v1: install/provides absent from
+    // v1's manifest => absent-as-empty (cleared, nothing re-added), while
+    // v1's boot_grace comes back.
+    try fx_store_rollback(s, 1, false, &e);
+    {
+        var c = Canon{ .db = db };
+        c.install(try live_rows(db, "install"));
+        try testing.expectEqual(@as(usize, 0), c.sorted().len);
+    }
+    {
+        var c = Canon{ .db = db };
+        c.provides(try live_rows(db, "provides"));
+        try testing.expectEqual(@as(usize, 0), c.sorted().len);
+    }
+    {
+        var c = Canon{ .db = db };
+        c.boot_grace(try live_rows(db, "boot_grace"));
+        const exp = [_][]const u8{"30000"};
+        try expect_lines(&exp, c.sorted());
+    }
+    {
+        var ce = cl.ErrBuf{};
+        const names = try cl.fx_closure_names(db, &ce);
+        defer cl.free_names(names);
+        try testing.expectEqual(@as(usize, 1), names.len);
+    }
+
+    // version accounting: 3 fixtures + 3 rollbacks x (publish + closure
+    // rebuild) = 9, CURRENT at the newest.
+    try testing.expectEqual(@as(c_long, 9), dl_snapshot_versions(db, null, 0));
+    var cur: u32 = 0;
+    try fx_store_current_version(io, s, &cur, &e);
+    try testing.expectEqual(@as(u32, 9), cur);
 }
 
 // ─── fx_store_gc_retain ─────────────────────────────────────────────────────
