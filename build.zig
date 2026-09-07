@@ -94,6 +94,26 @@ pub fn build(b: *std.Build) void {
     // the store unit tests open LIVE dbs, so the module links libdatalog.so
     // (the fx-init dedicated-test-module pattern); linked below.
 
+    // provenance: the Lens-2 query ENGINE (port-side unit U2) — read-only
+    // what/why/verify over the snapshot-versioned install/provides facts
+    // fx-activate writes into the store db.  Imports only the Zig store
+    // modules (closure/store/packageset/derivation — never main.zig), dl_*
+    // FFI to the Zig-built libdatalog.so for the as-of readers.
+    const prov_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/provenance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+            .{ .name = "derivation", .module = derivation_mod },
+            .{ .name = "closure", .module = closure_mod },
+            .{ .name = "store", .module = store_mod },
+        },
+    });
+    // the provenance unit tests open LIVE dbs, so the module links
+    // libdatalog.so (the fx-init dedicated-test-module pattern); linked below.
+
     // datalog-dafsa engine: link the Zig-built libdatalog.so from the sibling
     // ../datalog-dafsa checkout (the migrated engine) instead of compiling the
     // stale vendored C engine into this binary.  The .so exports the full
@@ -102,6 +122,7 @@ pub fn build(b: *std.Build) void {
     // resolve the .so at runtime without LD_LIBRARY_PATH.
     linkDatalog(b, closure_mod);
     linkDatalog(b, store_mod);
+    linkDatalog(b, prov_mod);
 
     // main: the U6 CLI (port of main.c) — the final 'fxstore' executable,
     // wiring ALL five ported units together; links libdatalog.so because
@@ -142,6 +163,10 @@ pub fn build(b: *std.Build) void {
     // main.zig unit tests (usage/parse_args/template goldens under /tmp).
     const main_tests = b.addTest(.{ .root_module = main_mod });
     const run_main_tests = b.addRunArtifact(main_tests);
+    // provenance.zig unit tests (live dbs + fixture rootfs/store under /tmp;
+    // the corpus packageset good.dhall is the package graph).
+    const prov_tests = b.addTest(.{ .root_module = prov_mod });
+    const run_prov_tests = b.addRunArtifact(prov_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_ps_tests.step);
     test_step.dependOn(&run_drv_tests.step);
@@ -149,6 +174,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_bld_tests.step);
     test_step.dependOn(&run_st_tests.step);
     test_step.dependOn(&run_main_tests.step);
+    test_step.dependOn(&run_prov_tests.step);
 }
 
 // Link the Zig-built datalog-dafsa engine .so (sibling ../datalog-dafsa
