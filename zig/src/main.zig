@@ -87,8 +87,13 @@ const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 const EEXIST: c_int = 17;
 
-/// glibc x86_64/aarch64 `struct stat` — only st_mode is consumed (init).
-const CStat = extern struct {
+/// x86_64 glibc/musl `struct stat` — only st_mode is consumed (init).
+/// MEASURED on x86_64-linux-gnu and x86_64-linux-musl: st_mode @24, 144 bytes.
+/// (This is NOT the i386 layout — see CStatI386.  Nor the aarch64 one: there
+/// st_mode is @16 in a 128-byte struct, measured by _Static_assert against the
+/// aarch64 headers; no aarch64 build is run on this host, so CStat does not
+/// cover it.)
+const CStatX86_64 = extern struct {
     dev: u64,
     ino: u64,
     nlink: u64,
@@ -106,6 +111,32 @@ const CStat = extern struct {
     _reserved: [3]u64,
 };
 
+/// i386 musl `struct stat` — st_mode @16, 144 bytes.
+/// MEASURED empirically, not inferred: a C probe built with `zig cc -target
+/// x86-linux-musl` prints offsetof(st_mode)==16 and stats a real 0644 file,
+/// where the raw words show 0100644 landing at +16 (on x86_64 the same probe
+/// shows it at +24).  musl's i386 layout is not the x86_64 one — the dev/ino/
+/// rdev fields pack differently.  Only st_mode is consumed, so the rest is
+/// kept as opaque padding; the total must stay `sizeof(struct stat)` or libc's
+/// stat() would write past the struct.
+const CStatI386 = extern struct {
+    _head: [16]u8,
+    mode: u32,
+    _tail: [124]u8,
+};
+
+const CStat = if (@import("builtin").target.cpu.arch == .x86) CStatI386 else CStatX86_64;
+
+comptime {
+    const arch = @import("builtin").target.cpu.arch;
+    const want_mode: usize = if (arch == .x86) 16 else 24;
+    const want_size: usize = 144;
+    if (@offsetOf(CStat, "mode") != want_mode)
+        @compileError("struct stat st_mode offset changed for this target — re-measure it");
+    if (@sizeOf(CStat) != want_size)
+        @compileError("struct stat size changed for this target — re-measure it");
+}
+
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
@@ -113,6 +144,11 @@ extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn stat(path: [*:0]const u8, st: *CStat) c_int;
 extern "c" fn strerror(errnum: c_int) [*:0]const u8;
 extern "c" fn strtol(nptr: [*:0]const u8, endptr: ?*[*:0]u8, base: c_int) c_long;
+// The version parses below take values in 1..4294967295, which does not fit
+// a 32-bit c_long: on i386 strtol saturates at LONG_MAX (2147483647, ERANGE)
+// and would silently accept a clamped version.  strtoll returns 64 bits on
+// every target, so the range check means the same thing everywhere.
+extern "c" fn strtoll(nptr: [*:0]const u8, endptr: ?*[*:0]u8, base: c_int) c_longlong;
 
 fn errno() c_int {
     return std.c._errno().*;
@@ -278,8 +314,8 @@ fn parse_as_of(val: []const u8, c: *CliArgs) bool {
     };
     defer c_alloc.free(zv);
     var end: [*:0]u8 = undefined;
-    const n = strtol(zv.ptr, &end, 10);
-    if (end[0] != 0 or n <= 0 or @as(u64, @bitCast(n)) > 0xFFFFFFFF) {
+    const n = strtoll(zv.ptr, &end, 10);
+    if (end[0] != 0 or n <= 0 or @as(u64, @intCast(n)) > 0xFFFFFFFF) {
         err_print("fxstore: invalid --as-of version '{s}' (expected an integer in 1..4294967295)\n", .{val});
         return false;
     }
@@ -622,8 +658,8 @@ fn cmd_rollback(io: Io, argv: []const []const u8, start: usize) u8 {
     };
     defer c_alloc.free(zv);
     var end: [*:0]u8 = undefined;
-    const v = strtol(zv.ptr, &end, 10);
-    if (end[0] != 0 or v <= 0 or @as(u64, @bitCast(v)) > 0xFFFFFFFF) {
+    const v = strtoll(zv.ptr, &end, 10);
+    if (end[0] != 0 or v <= 0 or @as(u64, @intCast(v)) > 0xFFFFFFFF) {
         err_print("fxstore: invalid version '{s}' (expected an integer in 1..4294967295)\n", .{vs});
         return 2;
     }

@@ -15,6 +15,47 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // -----------------------------------------------------------------------
+    // libdatalog linkage (the still-Zig datalog core, C-FFI).
+    //
+    // NATIVE/gnu builds: EXACTLY as before — linkSystemLibrary("datalog")
+    // against the sibling datalog-dafsa/zig-out/lib/libdatalog.so (the
+    // prebuilt glibc shared object) + the baked rpath.
+    //
+    // MUSL builds: a glibc-built .so cannot serve an i386-musl link (ld.lld:
+    // "libdatalog.so is incompatible with elf_i386") and a dynamic link would
+    // defeat the static goal, so we instead link a STATIC libdatalog.a BUILT
+    // IN THIS BUILD GRAPH from the sibling's Zig sources
+    // (datalog-dafsa/zig/src/hybrid.zig + the vendored dafsa engine) for the
+    // SAME target.  In-graph rather than a prebuilt path because the artifact
+    // must be target-coupled to whatever -Dtarget the user passes.  Same
+    // pattern as fx-core/build.zig.
+    // -----------------------------------------------------------------------
+    const datalog_mod = b.createModule(.{
+        .root_source_file = b.path("../datalog-dafsa/zig/src/hybrid.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dafsa_abi", .module = b.createModule(.{
+                .root_source_file = b.path("../datalog-dafsa/vendor/dafsa/zig/src/abi.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }) },
+        },
+    });
+    const is_musl = target.result.abi.isMusl();
+    // Created unconditionally (as in fx-core): an unreferenced step is never
+    // compiled, so the native build is untouched.
+    const datalog_lib = b.addLibrary(.{
+        .name = "datalog",
+        .linkage = .static,
+        .root_module = datalog_mod,
+    });
+    datalog_lib.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
+    datalog_lib.root_module.addIncludePath(b.path("../datalog-dafsa/vendor/dafsa"));
+
     const dhall_mod = b.createModule(.{
         .root_source_file = b.path("../dhall-c/zig/src/dhall_mod.zig"),
         .target = target,
@@ -120,9 +161,9 @@ pub fn build(b: *std.Build) void {
     // dl_*/dafsa_*/tokenize/regex_* surface the closure/store dl_* externs
     // need; the baked absolute rpath lets the unit tests (which open live dbs)
     // resolve the .so at runtime without LD_LIBRARY_PATH.
-    linkDatalog(b, closure_mod);
-    linkDatalog(b, store_mod);
-    linkDatalog(b, prov_mod);
+    linkDatalog(b, closure_mod, is_musl, datalog_lib);
+    linkDatalog(b, store_mod, is_musl, datalog_lib);
+    linkDatalog(b, prov_mod, is_musl, datalog_lib);
 
     // main: the U6 CLI (port of main.c) — the final 'fxstore' executable,
     // wiring ALL five ported units together; links libdatalog.so because
@@ -142,7 +183,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "provenance", .module = prov_mod },
         },
     });
-    linkDatalog(b, main_mod);
+    linkDatalog(b, main_mod, is_musl, datalog_lib);
     const fxstore_exe = b.addExecutable(.{ .name = "fxstore", .root_module = main_mod });
     b.installArtifact(fxstore_exe);
 
@@ -178,12 +219,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prov_tests.step);
 }
 
-// Link the Zig-built datalog-dafsa engine .so (sibling ../datalog-dafsa
-// checkout) into `m`.  The library path and the baked rpath are both the .so's
-// absolute directory, so linked binaries/tests resolve it at runtime from any
-// cwd.  `b.path` resolves the relative path against the build root.
-fn linkDatalog(b: *std.Build, m: *std.Build.Module) void {
-    m.linkSystemLibrary("datalog", .{});
-    m.addLibraryPath(b.path("../datalog-dafsa/zig-out/lib"));
-    m.addRPath(b.path("../datalog-dafsa/zig-out/lib"));
+// Link the datalog-dafsa engine into `m`.  Native/gnu: the Zig-built
+// libdatalog.so from the sibling ../datalog-dafsa checkout, with the library
+// path and the baked rpath both the .so's absolute directory, so linked
+// binaries/tests resolve it at runtime from any cwd (unchanged).  Musl: the
+// in-graph STATIC libdatalog (i386 has no glibc .so, and a dynamic link would
+// defeat the static goal).
+fn linkDatalog(b: *std.Build, m: *std.Build.Module, is_musl: bool, datalog_lib: *std.Build.Step.Compile) void {
+    if (is_musl) {
+        m.linkLibrary(datalog_lib);
+    } else {
+        m.linkSystemLibrary("datalog", .{});
+        m.addLibraryPath(b.path("../datalog-dafsa/zig-out/lib"));
+        m.addRPath(b.path("../datalog-dafsa/zig-out/lib"));
+    }
 }
