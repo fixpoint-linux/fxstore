@@ -362,7 +362,9 @@ pub const RelSchema = struct {
 /// kind.  MEASURED census of the writers: fx-activate declares
 /// generation/svc/svc_argv/svc_env/svc_probe/svc_bin/svc_backoff/
 /// svc_console/user/tool_fxstore/boot_grace/install/provides/activate_root
-/// (activate.zig:1208-1223); fxstore's own snapshots carry pkg/dep/root
+/// (activate.zig:1208-1223) and src_of a3, all-sym, in commitClosureMeta
+/// (activate.zig — the deriv-hash -> src-hash binding beside the
+/// store/srcstore pair); fxstore's own snapshots carry pkg/dep/root
 /// (closure.zig), store/srcstore (store.zig:320-327).  The raw-u32 columns:
 /// install.mode (0o644/0, activate.zig:1355-1357), generation.epoch,
 /// svc_argv.idx (activate.zig:1306), svc_backoff.backoff_ms,
@@ -380,6 +382,7 @@ pub const RELATION_SCHEMAS = [_]RelSchema{
     .{ .name = "pkg", .arity = 1, .cols = &.{.sym} },
     .{ .name = "provides", .arity = 2, .cols = &.{ .sym, .sym } },
     .{ .name = "root", .arity = 1, .cols = &.{.sym} },
+    .{ .name = "src_of", .arity = 3, .cols = &.{ .sym, .sym, .sym } },
     .{ .name = "srcstore", .arity = 2, .cols = &.{ .sym, .sym } },
     .{ .name = "store", .arity = 2, .cols = &.{ .sym, .sym } },
     .{ .name = "svc", .arity = 3, .cols = &.{ .sym, .sym, .sym } },
