@@ -20,12 +20,17 @@ usage:
   fxstore verify [<rootfs>] [--as-of N] [--store DIR]
                                           reconcile <rootfs> (default /) against the
                                           recorded install facts; exit 1 on drift
+  fxstore facts <relation> [--as-of N] [--store DIR]
+                                          dump one fact relation (install, provides,
+                                          svc_bin, srcstore, ...) one fact per line,
+                                          TAB-separated; symbols resolved to strings,
+                                          raw u32 columns in decimal
 options:
   --store DIR   store root (default: /fx/store)
   --retain N    (gc) keep the N most-recent snapshot versions, prune the rest
   -n N          same as --retain N
   --hard        (rollback) recovery-only: repoint CURRENT directly at <v>, no new version
-  --as-of N     (what/why/verify) read snapshot version N instead of the newest published
+  --as-of N     (what/why/verify/facts) read snapshot version N instead of the newest published
                 (a manual rollback does not re-publish — use --as-of to read the
                 rolled-back activation facts)
   -h, --help    show this help

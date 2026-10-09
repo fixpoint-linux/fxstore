@@ -335,6 +335,179 @@ fn dupe_list(items: []const []const u8, e: *ProvErrBuf) ProvError![][]const u8 {
     return out;
 }
 
+// ─── facts: the generic, version-bound, READ-ONLY relation dump ───────────
+//
+// The gap this closes: what/why/verify answer three FIXED questions, and
+// prov_why reads only provides/install — nothing let a caller ask the store
+// for its OWN facts (svc_bin, srcstore, ...) as-of a snapshot.  Globbing
+// <store>/*-<name>-src is not a substitute: several src hashes for one name
+// can coexist, and only the version-bound srcstore fact says which one THIS
+// generation is built from.
+
+/// How one column of a fact relation is stored: an interned symbol id, or a
+/// raw u32 value.  The kind is NOT derivable at runtime (a raw 420 and a
+/// symbol id 420 are indistinguishable in a u32 column), so the table below
+/// is the only honest authority — a relation missing from it is a LOUD
+/// error, never an empty success (an empty success on a typo is a
+/// silently-inert oracle).
+pub const FactCol = enum { sym, raw };
+
+pub const RelSchema = struct {
+    name: [:0]const u8,
+    arity: u8,
+    cols: []const FactCol, // len == arity
+};
+
+/// Every fact relation a writer in this stack declares, with each column's
+/// kind.  MEASURED census of the writers: fx-activate declares
+/// generation/svc/svc_argv/svc_env/svc_probe/svc_bin/svc_backoff/
+/// svc_console/user/tool_fxstore/boot_grace/install/provides/activate_root
+/// (activate.zig:1208-1223); fxstore's own snapshots carry pkg/dep/root
+/// (closure.zig), store/srcstore (store.zig:320-327).  The raw-u32 columns:
+/// install.mode (0o644/0, activate.zig:1355-1357), generation.epoch,
+/// svc_argv.idx (activate.zig:1306), svc_backoff.backoff_ms,
+/// svc_console.console_flag (the svc_backoff convention,
+/// activate.zig:1294-1303), user.uid, boot_grace.ms.  `closure` (IDB,
+/// derived, recomputed) and `rev` (the reserved CAS relation) are
+/// deliberately absent: they are not facts.  Keep sorted by name — the
+/// unknown-relation error lists them in table order.
+pub const RELATION_SCHEMAS = [_]RelSchema{
+    .{ .name = "activate_root", .arity = 1, .cols = &.{.sym} },
+    .{ .name = "boot_grace", .arity = 1, .cols = &.{.raw} },
+    .{ .name = "dep", .arity = 2, .cols = &.{ .sym, .sym } },
+    .{ .name = "generation", .arity = 4, .cols = &.{ .sym, .sym, .sym, .raw } },
+    .{ .name = "install", .arity = 4, .cols = &.{ .sym, .sym, .raw, .sym } },
+    .{ .name = "pkg", .arity = 1, .cols = &.{.sym} },
+    .{ .name = "provides", .arity = 2, .cols = &.{ .sym, .sym } },
+    .{ .name = "root", .arity = 1, .cols = &.{.sym} },
+    .{ .name = "srcstore", .arity = 2, .cols = &.{ .sym, .sym } },
+    .{ .name = "store", .arity = 2, .cols = &.{ .sym, .sym } },
+    .{ .name = "svc", .arity = 3, .cols = &.{ .sym, .sym, .sym } },
+    .{ .name = "svc_argv", .arity = 3, .cols = &.{ .sym, .raw, .sym } },
+    .{ .name = "svc_backoff", .arity = 2, .cols = &.{ .sym, .raw } },
+    .{ .name = "svc_bin", .arity = 2, .cols = &.{ .sym, .sym } },
+    .{ .name = "svc_console", .arity = 2, .cols = &.{ .sym, .raw } },
+    .{ .name = "svc_env", .arity = 3, .cols = &.{ .sym, .sym, .sym } },
+    .{ .name = "svc_probe", .arity = 3, .cols = &.{ .sym, .sym, .sym } },
+    .{ .name = "tool_fxstore", .arity = 1, .cols = &.{.sym} },
+    .{ .name = "user", .arity = 3, .cols = &.{ .sym, .raw, .sym } },
+};
+
+/// Look up a relation's schema, or null when no writer in this stack
+/// declares it.
+pub fn prov_rel_schema(rel: []const u8) ?*const RelSchema {
+    for (&RELATION_SCHEMAS) |*s| {
+        if (std.mem.eql(u8, s.name, rel)) return s;
+    }
+    return null;
+}
+
+/// One resolved cell of a fact: a symbol's string, or a raw u32.
+pub const FactVal = union(enum) {
+    sym: []const u8,
+    raw: u32,
+};
+
+/// All facts of one relation, as-of the requested version, in the order the
+/// relation stores them.  Strings and rows are c_allocator-owned; free with
+/// prov_free_facts.
+pub const FactsResult = struct {
+    rel: []const u8,
+    arity: u8,
+    rows: [][]FactVal,
+};
+
+/// Dump every fact of `rel` as-of `v`, symbols resolved to their strings
+/// and raw u32 columns carried as values.  A relation ABSENT from that
+/// version reads as EMPTY (the read_rel allow-absent idiom — old snapshots
+/// predate the relation), and a relation absent from the SCHEMA TABLE is a
+/// hard error naming what does exist.
+pub fn prov_facts(db: ?*DlDb, rel: []const u8, v: Version, e: *ProvErrBuf) ProvError!FactsResult {
+    const d = db orelse return e.set("internal: null db", .{});
+    const schema = prov_rel_schema(rel) orelse {
+        var aw: Io.Writer.Allocating = .init(c_alloc);
+        defer aw.deinit();
+        aw.writer.print("unknown relation '{s}' (known: ", .{rel}) catch unreachable;
+        for (RELATION_SCHEMAS, 0..) |s, i| {
+            const sep: []const u8 = if (i != 0) ", " else "";
+            aw.writer.print("{s}{s}", .{ sep, s.name }) catch unreachable;
+        }
+        aw.writer.print(")", .{}) catch unreachable;
+        return e.set("{s}", .{aw.written()});
+    };
+
+    var arena = std.heap.ArenaAllocator.init(c_alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var version: u32 = 0;
+    try resolve_version(a, d, v, e, &version);
+
+    var bag = try read_rel(a, d, version, schema.name.ptr, e);
+    try check_arity(&bag, schema.arity, schema.name.ptr, e);
+
+    const rows = c_alloc.alloc([]FactVal, bag.n) catch return e.set("out of memory", .{});
+    var n: usize = 0;
+    errdefer {
+        for (rows[0..n]) |row| {
+            for (row) |cv| switch (cv) {
+                .sym => |s| c_alloc.free(s),
+                .raw => {},
+            };
+            c_alloc.free(row);
+        }
+        c_alloc.free(rows);
+    }
+    for (0..bag.n) |i| {
+        const tuple = bag.tuples.items[i * schema.arity ..][0..schema.arity];
+        const row = c_alloc.alloc(FactVal, schema.arity) catch return e.set("out of memory", .{});
+        errdefer c_alloc.free(row);
+        for (schema.cols, 0..) |kind, c| {
+            row[c] = switch (kind) {
+                // sym_name dupes into the CALLER's arena (freed below); the
+                // FactsResult contract is c_allocator-owned, so re-dupe.
+                .sym => .{ .sym = try dupe_str(try sym_name(a, d, tuple[c], e), e) },
+                .raw => .{ .raw = tuple[c] },
+            };
+        }
+        rows[n] = row;
+        n += 1;
+    }
+    return .{
+        .rel = try dupe_str(schema.name, e),
+        .arity = schema.arity,
+        .rows = rows,
+    };
+}
+
+pub fn prov_free_facts(r: FactsResult) void {
+    for (r.rows) |row| {
+        for (row) |cv| switch (cv) {
+            .sym => |s| c_alloc.free(s),
+            .raw => {},
+        };
+        c_alloc.free(row);
+    }
+    c_alloc.free(r.rows);
+    c_alloc.free(r.rel);
+}
+
+/// One line per fact, columns TAB-separated, symbols as strings and raw u32
+/// as decimal, a trailing newline on the last line.  No header: the caller
+/// knows the relation and its arity.
+pub fn prov_render_facts(w: anytype, r: *const FactsResult) !void {
+    for (r.rows) |row| {
+        for (row, 0..) |cv, c| {
+            if (c != 0) try w.writeAll("\t");
+            switch (cv) {
+                .sym => |s| try w.writeAll(s),
+                .raw => |v| try w.print("{d}", .{v}),
+            }
+        }
+        try w.writeAll("\n");
+    }
+}
+
 // ─── prov_what ─────────────────────────────────────────────────────────────
 
 /// Which install fact manages `target` (rootfs-absolute), as-of `v`; the
@@ -913,6 +1086,80 @@ fn activate(db: *DlDb) !void {
     if (cl.dl_publish_snapshot(db) != 0) return error.DlPublish;
 }
 
+/// A SECOND activation (v3), the fixture for the facts dump: fx-activate's
+/// own service-fact and closure-metadata shape (activate.zig:1283-1339 the
+/// svc loop, :1351-1393 install/provides, :1395-1400 commitClosureMeta) —
+/// one pkg'd service (store-relative bin, activate.zig:1316-1319), one
+/// non-pkg'd one (verbatim /bin/sh argv[0], :1320), the raw-u32 columns
+/// (svc_backoff/svc_console/svc_argv idx), and ONE MORE install + provides
+/// + srcstore/store pair so install/provides/srcstore genuinely DIFFER
+/// between v2 and v3 (the as-of binding pin).
+fn activate_gen2(db: *DlDb) !void {
+    if (cl.dl_declare_relation(db, "svc", 3) != 0) return error.DlDeclare;
+    if (cl.dl_declare_relation(db, "svc_argv", 3) != 0) return error.DlDeclare;
+    if (cl.dl_declare_relation(db, "svc_bin", 2) != 0) return error.DlDeclare;
+    if (cl.dl_declare_relation(db, "svc_backoff", 2) != 0) return error.DlDeclare;
+    if (cl.dl_declare_relation(db, "svc_console", 2) != 0) return error.DlDeclare;
+    // store/srcstore are declared by fx_store_open; this fixture db is a
+    // bare dl_open, so declare them idempotently first (commitClosureMeta's
+    // own reason for its activate_root declare, activate.zig:898-901).
+    if (cl.dl_declare_relation(db, "store", 2) != 0) return error.DlDeclare;
+    if (cl.dl_declare_relation(db, "srcstore", 2) != 0) return error.DlDeclare;
+    if (st.dl_txn_begin(db) != 0) return error.DlTxn;
+    errdefer _ = st.dl_txn_rollback(db);
+
+    const hb2 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const F = struct {
+        fn ss(d: *DlDb, rel: [*:0]const u8, a: [:0]const u8, b: [:0]const u8) !void {
+            const cols = [2]u32{ cl.dl_intern_str(d, a.ptr), cl.dl_intern_str(d, b.ptr) };
+            if (st.dl_txn_add_fact(d, rel, &cols, 2) != 0) return error.DlFact;
+        }
+        fn su(d: *DlDb, rel: [*:0]const u8, a: [:0]const u8, b: u32) !void {
+            const cols = [2]u32{ cl.dl_intern_str(d, a.ptr), b };
+            if (st.dl_txn_add_fact(d, rel, &cols, 2) != 0) return error.DlFact;
+        }
+        fn sss(d: *DlDb, rel: [*:0]const u8, a: [:0]const u8, b: [:0]const u8, c: [:0]const u8) !void {
+            const cols = [3]u32{ cl.dl_intern_str(d, a.ptr), cl.dl_intern_str(d, b.ptr), cl.dl_intern_str(d, c.ptr) };
+            if (st.dl_txn_add_fact(d, rel, &cols, 3) != 0) return error.DlFact;
+        }
+        fn srs(d: *DlDb, rel: [*:0]const u8, a: [:0]const u8, b: u32, c: [:0]const u8) !void {
+            const cols = [3]u32{ cl.dl_intern_str(d, a.ptr), b, cl.dl_intern_str(d, c.ptr) };
+            if (st.dl_txn_add_fact(d, rel, &cols, 3) != 0) return error.DlFact;
+        }
+        fn install(d: *DlDb, target: [:0]const u8, origin: [:0]const u8, mode: u32, gh: [:0]const u8) !void {
+            const cols = [4]u32{ cl.dl_intern_str(d, target.ptr), cl.dl_intern_str(d, origin.ptr), mode, cl.dl_intern_str(d, gh.ptr) };
+            if (st.dl_txn_add_fact(d, "install", &cols, 4) != 0) return error.DlFact;
+        }
+    };
+
+    var b1: [128:0]u8 = undefined;
+    var b2: [128:0]u8 = undefined;
+    var b3: [128:0]u8 = undefined;
+    var b4: [128:0]u8 = undefined;
+    var b5: [128:0]u8 = undefined;
+    var b6: [128:0]u8 = undefined;
+
+    // svc(name, on, restart) — all symbols
+    try F.sss(db, "svc", zify(&b1, "heartbeat"), zify(&b2, "all"), zify(&b3, "always"));
+    // the raw-u32 service facts (svc_backoff ms, svc_console flag)
+    try F.su(db, "svc_backoff", zify(&b1, "heartbeat"), 500);
+    try F.su(db, "svc_console", zify(&b1, "heartbeat"), 1);
+    // svc_argv(name, idx RAW, arg)
+    try F.srs(db, "svc_argv", zify(&b1, "heartbeat"), 0, zify(&b4, "fakesvc"));
+    try F.srs(db, "svc_argv", zify(&b1, "heartbeat"), 1, zify(&b4, "ok"));
+    // svc_bin: pkg'd -> store-relative; non-pkg'd -> verbatim argv[0]
+    try F.ss(db, "svc_bin", zify(&b1, "heartbeat"), zify(&b5, hb2 ++ "/fakesvc"));
+    try F.ss(db, "svc_bin", zify(&b1, "shell"), zify(&b6, "/bin/sh"));
+    // the extra install/provides/srcstore/store rows (the v2-vs-v3 delta)
+    try F.install(db, zify(&b1, "/bin/fakesvc"), zify(&b2, hb2 ++ "-fake-service"), 0, gen);
+    try F.ss(db, "provides", zify(&b1, "fake-service"), zify(&b3, hb2 ++ "-fake-service"));
+    try F.ss(db, "srcstore", zify(&b2, hb2), zify(&b1, "fake-service"));
+    try F.ss(db, "store", zify(&b2, hb2), zify(&b1, "fake-service"));
+
+    if (st.dl_txn_commit(db) != 0) return error.DlTxn;
+    if (cl.dl_publish_snapshot(db) != 0) return error.DlPublish;
+}
+
 /// Test-side sha256 oracle (same primitive as file_sha256, so the drift
 /// DETAIL can be asserted to carry the real digests).
 fn hex_of(data: []const u8, out: *[64]u8) void {
@@ -1421,4 +1668,139 @@ test "prov_what/prov_why on a db with no published snapshot" {
     e = .{};
     try testing.expectError(error.FxProv, prov_why(db, "hello", .current, &e));
     try testing.expectEqualStrings("no published snapshot in the store db — run a build first", e.slice());
+}
+
+// ─── prov_facts tests ──────────────────────────────────────────────────────
+
+/// Render r's facts, split into lines, SORT (dl enumeration order is not
+/// part of the contract), and return the joined text (arena `a`).
+fn facts_lines_sorted(a: std.mem.Allocator, r: *const FactsResult) ![]const u8 {
+    var aw: Io.Writer.Allocating = .init(c_alloc);
+    defer aw.deinit();
+    try prov_render_facts(&aw.writer, r);
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, aw.written(), '\n');
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue; // the trailing newline's empty tail
+        try lines.append(a, ln);
+    }
+    std.mem.sort([]const u8, lines.items, {}, name_lt);
+    var out: Io.Writer.Allocating = .init(c_alloc);
+    defer out.deinit();
+    for (lines.items) |ln| try out.writer.print("{s}\n", .{ln});
+    return try a.dupe(u8, out.written());
+}
+
+test "prov_facts: symbols resolve, raw u32 prints decimal, --as-of BINDS, unknown relation is loud" {
+    var dir_buf: [64:0]u8 = undefined;
+    const dir = try temp_db_dir(&dir_buf);
+    const db = cl.dl_open(dir.ptr) orelse return error.DlOpenFailed;
+    defer {
+        cl.dl_close(db);
+        Io.Dir.cwd().deleteTree(tio(), dir) catch {};
+    }
+    var pe = pkgs.ErrBuf{};
+    var pset: pkgs.PackageSet = undefined;
+    try pkgs.fx_packageset_load(&pset, "zig/corpus/packageset/good.dhall", &pe);
+    defer pset.deinit();
+    var ce = cl.ErrBuf{};
+    try cl.fx_closure_compute(db, &pset, &.{}, &ce); // v1: predates everything below
+    try activate(db); // v2
+    try activate_gen2(db); // v3: CURRENT
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var e = ProvErrBuf{};
+
+    // null db is the internal error, not a crash
+    e = .{};
+    try testing.expectError(error.FxProv, prov_facts(null, "install", .current, &e));
+    try testing.expectEqualStrings("internal: null db", e.slice());
+
+    // (a) install as-of v2: 4 rows, symbols RESOLVED, the etc modes as
+    // DECIMAL 420 (0o644 — the raw-u32 column, activate.zig:1364), the bin
+    // symlinks as 0, all TAB-separated with a trailing newline.
+    const r2 = try prov_facts(db, "install", .{ .as_of = 2 }, &e);
+    defer prov_free_facts(r2);
+    try testing.expectEqualStrings("install", r2.rel);
+    try testing.expectEqual(@as(u8, 4), r2.arity);
+    try testing.expectEqual(@as(usize, 4), r2.rows.len);
+    const want2 =
+        "/bin/hello\t" ++ ha ++ "-hello\t0\t" ++ gen ++ "\n" ++
+        "/bin/world\t" ++ hb ++ "-world\t0\t" ++ gen ++ "\n" ++
+        "/etc/hosts\t" ++ gen ++ "-system-generation/etc/hosts\t420\t" ++ gen ++ "\n" ++
+        "/etc/motd\t" ++ gen ++ "-system-generation/etc/motd\t420\t" ++ gen ++ "\n";
+    try testing.expectEqualStrings(want2, try facts_lines_sorted(a, &r2));
+
+    // (b) --as-of REALLY BINDS — three independent witnesses:
+    //   install: 4 rows as-of v2 vs 5 as-of v3 (the extra /bin/fakesvc fact)
+    //   svc_bin: absent-as-empty as-of v2 (relation postdates) vs 2 rows v3
+    //   srcstore: 0 rows as-of v2 vs 1 row v3
+    const r3 = try prov_facts(db, "install", .{ .as_of = 3 }, &e);
+    defer prov_free_facts(r3);
+    try testing.expectEqual(@as(usize, 5), r3.rows.len);
+    // v3's install = v2's four lines PLUS the new fact: the delta is the
+    // binding witness, and it proves reading v3 did not disturb v2's read.
+    const hc = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const want3 = "/bin/fakesvc\t" ++ hc ++ "-fake-service\t0\t" ++ gen ++ "\n" ++ want2;
+    try testing.expectEqualStrings(want3, try facts_lines_sorted(a, &r3));
+
+    const b2 = try prov_facts(db, "svc_bin", .{ .as_of = 2 }, &e);
+    defer prov_free_facts(b2);
+    try testing.expectEqual(@as(usize, 0), b2.rows.len);
+
+    const b3 = try prov_facts(db, "svc_bin", .{ .as_of = 3 }, &e);
+    defer prov_free_facts(b3);
+    try testing.expectEqual(@as(usize, 2), b3.rows.len);
+    try testing.expectEqualStrings(
+        "heartbeat\t" ++ hc ++ "/fakesvc\nshell\t/bin/sh\n",
+        try facts_lines_sorted(a, &b3),
+    );
+
+    const s2 = try prov_facts(db, "srcstore", .{ .as_of = 2 }, &e);
+    defer prov_free_facts(s2);
+    try testing.expectEqual(@as(usize, 0), s2.rows.len);
+    const s3 = try prov_facts(db, "srcstore", .{ .as_of = 3 }, &e);
+    defer prov_free_facts(s3);
+    try testing.expectEqualStrings(hc ++ "\tfake-service\n", try facts_lines_sorted(a, &s3));
+
+    // raw u32 columns print as DECIMAL: svc_argv idx 0/1, svc_backoff 500,
+    // svc_console 1 (the svc_backoff convention).
+    const av = try prov_facts(db, "svc_argv", .{ .as_of = 3 }, &e);
+    defer prov_free_facts(av);
+    try testing.expectEqualStrings(
+        "heartbeat\t0\tfakesvc\nheartbeat\t1\tok\n",
+        try facts_lines_sorted(a, &av),
+    );
+    const bk = try prov_facts(db, "svc_backoff", .{ .as_of = 3 }, &e);
+    defer prov_free_facts(bk);
+    try testing.expectEqualStrings("heartbeat\t500\n", try facts_lines_sorted(a, &bk));
+    const cn = try prov_facts(db, "svc_console", .{ .as_of = 3 }, &e);
+    defer prov_free_facts(cn);
+    try testing.expectEqualStrings("heartbeat\t1\n", try facts_lines_sorted(a, &cn));
+
+    // .current resolves to the newest published (v3), same as what/why
+    const cur = try prov_facts(db, "svc_bin", .current, &e);
+    defer prov_free_facts(cur);
+    try testing.expectEqual(@as(usize, 2), cur.rows.len);
+
+    // (c) UNKNOWN RELATION is a LOUD error naming the relation AND the
+    // relations that exist — never an empty success.
+    e = .{};
+    try testing.expectError(error.FxProv, prov_facts(db, "svc_binn", .current, &e));
+    try testing.expect(std.mem.startsWith(u8, e.slice(), "unknown relation 'svc_binn' (known: "));
+    try testing.expect(std.mem.endsWith(u8, e.slice(), ")"));
+    for ([_][]const u8{ "install", "provides", "svc_bin", "srcstore", "store" }) |nm| {
+        const inside = try std.fmt.allocPrint(a, " {s},", .{nm});
+        const inside_last = try std.fmt.allocPrint(a, " {s})", .{nm});
+        try testing.expect(std.mem.indexOf(u8, e.slice(), inside) != null or
+            std.mem.indexOf(u8, e.slice(), inside_last) != null);
+    }
+
+    // a never-published version is still the resolve_version hard error
+    e = .{};
+    try testing.expectError(error.FxProv, prov_facts(db, "install", .{ .as_of = 99 }, &e));
+    try testing.expectEqualStrings("no such version 99 (have 3 version(s))", e.slice());
 }

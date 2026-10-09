@@ -188,12 +188,17 @@ pub fn usage(fd: c_int) void {
             "  fxstore verify [<rootfs>] [--as-of N] [--store DIR]\n" ++
             "                                          reconcile <rootfs> (default /) against the\n" ++
             "                                          recorded install facts; exit 1 on drift\n" ++
+            "  fxstore facts <relation> [--as-of N] [--store DIR]\n" ++
+            "                                          dump one fact relation (install, provides,\n" ++
+            "                                          svc_bin, srcstore, ...) one fact per line,\n" ++
+            "                                          TAB-separated; symbols resolved to strings,\n" ++
+            "                                          raw u32 columns in decimal\n" ++
             "options:\n" ++
             "  --store DIR   store root (default: {s})\n" ++
             "  --retain N    (gc) keep the N most-recent snapshot versions, prune the rest\n" ++
             "  -n N          same as --retain N\n" ++
             "  --hard        (rollback) recovery-only: repoint CURRENT directly at <v>, no new version\n" ++
-            "  --as-of N     (what/why/verify) read snapshot version N instead of the newest published\n" ++
+            "  --as-of N     (what/why/verify/facts) read snapshot version N instead of the newest published\n" ++
             "                (a manual rollback does not re-publish — use --as-of to read the\n" ++
             "                rolled-back activation facts)\n" ++
             "  -h, --help    show this help\n" ++
@@ -697,6 +702,36 @@ fn prov_open(io: Io, store_root: []const u8) ?*st.Store {
     return s;
 }
 
+fn cmd_facts(io: Io, argv: []const []const u8, start: usize) u8 {
+    var c = CliArgs{};
+    const pr = parse_args(argv, start, &c);
+    if (pr != 0) return if (pr == 1) 0 else 2;
+    defer cli_free(&c);
+    if (c.npos != 1) {
+        err_print("fxstore: facts requires exactly one relation name\n\n", .{});
+        usage(g_err_fd);
+        return 2;
+    }
+    const store_root = c.store_root orelse DEFAULT_STORE_ROOT;
+
+    const s = prov_open(io, store_root) orelse return 1;
+    defer st.fx_store_close(s);
+
+    var e = prov.ProvErrBuf{};
+    const r = prov.prov_facts(st.fx_store_db(s), c.pos[0], prov_version(&c), &e) catch {
+        err_print("fxstore: {s}\n", .{e.slice()});
+        return 1;
+    };
+    defer prov.prov_free_facts(r);
+
+    var aw: Io.Writer.Allocating = .init(c_alloc);
+    defer aw.deinit();
+    prov.prov_render_facts(&aw.writer, &r) catch return 1;
+    const out = aw.written();
+    _ = write(g_out_fd, out.ptr, out.len);
+    return 0;
+}
+
 fn cmd_what(io: Io, argv: []const []const u8, start: usize) u8 {
     var c = CliArgs{};
     const pr = parse_args(argv, start, &c);
@@ -978,6 +1013,8 @@ pub fn main(init: std.process.Init) !void {
         rc = cmd_why(io, args, 2);
     } else if (std.mem.eql(u8, cmd.?, "verify")) {
         rc = cmd_verify(io, args, 2);
+    } else if (std.mem.eql(u8, cmd.?, "facts")) {
+        rc = cmd_facts(io, args, 2);
     } else {
         err_print("fxstore: unknown command '{s}'\n\n", .{cmd.?});
         usage(g_err_fd);
