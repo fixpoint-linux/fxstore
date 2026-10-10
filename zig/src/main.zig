@@ -987,6 +987,7 @@ pub fn main(init: std.process.Init) !void {
     bld.fx_stage3_resolve();
     bld.fx_bwrap_resolve(); // lock the bwrap path before recipes run
     bld.fx_cosmo_resolve(); // lock the cosmocc toolchain tree before recipes run
+    bld.fx_shell_resolve(); // lock the recipe interpreter (FXSTORE_SH) likewise
 
     if (cmd == null or std.mem.eql(u8, cmd.?, "-h") or std.mem.eql(u8, cmd.?, "--help")) {
         usage(if (cmd != null) g_out_fd else g_err_fd);

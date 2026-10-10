@@ -23,7 +23,8 @@
 //   - stage3/bwrap/cosmo are resolved EXACTLY ONCE (first call wins), from
 //     main() before any package set is loaded — a recipe's Env action can
 //     rewrite PATH or FXSTORE_STAGE3, and must not be able to re-point the
-//     sandbox at its own code.
+//     sandbox at its own code.  The recipe interpreter (FXSTORE_SH, default
+//     /bin/sh) is resolved with the same once-at-startup discipline.
 //
 // DIFFERENCES FROM C (mechanical only — never observable): the bwrap argv,
 // the LANDLOCK_SPEC, the scrub list, the cosmo PATH prepend and the
@@ -308,6 +309,43 @@ pub fn stage3_path() ?[]const u8 {
 fn stage3_bin() [:0]const u8 {
     if (g_stage3_path == null) fx_stage3_resolve();
     return g_stage3_path.?;
+}
+
+// ─── the recipe shell (FXSTORE_SH) ─────────────────────────────────────────
+//
+// Shell actions exec ONE absolute interpreter path, never a PATH lookup
+// (recipes control PATH from the first Env action on).  On the host that
+// path is /bin/sh.  In the fx guest it cannot be: fx-init pivots to a
+// tmpfs whose /bin holds ONLY the generation's materialized links, so
+// /bin/sh does not exist where a guest build runs (MEASURED,
+// fx-harness tests/qemu-agent-slot.sh: the stub runner's shebang is
+// /usr/bin/busybox sh for exactly this reason).  FXSTORE_SH names the
+// interpreter for that world — a deployment-staged absolute path (e.g.
+// /usr/fx-agent/bin/sh -> busybox, bound through the pivot with /usr).
+// Resolved with the SAME once-at-startup discipline as FXSTORE_STAGE3: a
+// recipe's Env action must not be able to re-point the interpreter at its
+// own code mid-build.
+pub const shell_default_path = "/bin/sh";
+
+var g_shell_path: ?[:0]const u8 = null;
+
+/// Resolved EXACTLY ONCE: the FXSTORE_SH env override if set when fxstore
+/// started, else "/bin/sh".  Called from main() before any package-set is
+/// loaded.
+pub fn fx_shell_resolve() void {
+    if (g_shell_path != null) return;
+    const p = getenv("FXSTORE_SH");
+    g_shell_path =
+        if (p != null and p.?[0] != 0) std.mem.span(p.?) else shell_default_path;
+}
+
+pub fn shell_path() ?[]const u8 {
+    return g_shell_path;
+}
+
+fn shell_bin() [:0]const u8 {
+    if (g_shell_path == null) fx_shell_resolve();
+    return g_shell_path.?;
 }
 
 /// Resolved absolute bwrap path (null when not resolvable at startup).
@@ -771,7 +809,7 @@ fn run_action(
     switch (a.kind) {
         .shell => {
             out_print("{s}\n", .{aa}); // echo, like make
-            const sh_argv = [_][]const u8{ "/bin/sh", "-c", aa };
+            const sh_argv = [_][]const u8{ shell_bin(), "-c", aa };
             return run_sandboxed(workdir, src_ro, store_root, &sh_argv);
         },
         .copy => {
