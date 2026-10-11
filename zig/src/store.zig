@@ -773,6 +773,45 @@ pub fn fx_store_gc(io: Io, s: ?*Store, root_pkg: []const u8, e: *ErrBuf) Error!v
     // 3. liveness: name-level reachability from the root
     const live = try reachable_names(a, &deps, root_pkg, e);
 
+    // 3b. GENERATION-DIR CARVE-OUT: a `<genhash>-system-generation` dir is
+    // not a package — no dep/store/srcstore/pkg fact ever names it — but it
+    // holds the generation's Dhakefile and the RETAINED CONFIG the
+    // generation_config link exists to preserve (fx-init 1399dbd), so the
+    // name-level sweep would reap it.  Liveness comes from the generation
+    // facts themselves: every SURVIVING snapshot version's
+    // generation(genhash, buildfile_rel, ...) row names its own dir in
+    // buildfile_rel's FIRST component (store-relative, fx-activate's
+    // writer).  Reading EVERY version still present — not just the pinned
+    // one — is what keeps the carve-out PRECISE: a dir is retained because
+    // a surviving snapshot names it, and a dir whose snapshot was pruned
+    // by gc --retain is reapable like any unreachable entry.  Keep by FULL
+    // name (`<genhash>-system-generation`), never by adding the bare
+    // string "system-generation" to the name-live set: that would pin
+    // every such dir including pruned ones, and a package may legally be
+    // named "system-generation".
+    var gen_dirs: std.ArrayList([]const u8) = .empty;
+    {
+        var gen_bag = PairBag{ .db = st.db, .alloc = a };
+        for (vers[0..@intCast(total)]) |v| {
+            // -1 = the relation is absent from that version (a store
+            // predating activation, or an older snapshot): not an error
+            const rg = dl_query_version(st.db, v, "generation", pair_cb, &gen_bag);
+            if (rg < 0) continue;
+            if (gen_bag.oom)
+                return e.set("generation fact read failed (version {d})", .{v});
+        }
+        // gen_bag.b holds the buildfile_rel paths; take each one's FIRST
+        // component (the dir the fact names).  The bag is arena-owned, so
+        // the slices are stable — no dupe needed.
+        for (gen_bag.b.items) |bf| {
+            const slash = std.mem.indexOfScalar(u8, bf, '/') orelse continue;
+            const dir = bf[0..slash];
+            if (in_set(gen_dirs.items, dir)) continue;
+            gen_dirs.append(a, dir) catch
+                return e.set("out of memory computing generation-dir liveness", .{});
+        }
+    }
+
     // 4. METADATA FIRST: atomically txn-delete the unreachable store AND
     // srcstore facts (a crash after this leaves reapable orphan dirs —
     // never dangling metadata pointing at missing dirs)
@@ -842,9 +881,26 @@ pub fn fx_store_gc(io: Io, s: ?*Store, root_pkg: []const u8, e: *ErrBuf) Error!v
         // is live — GC must never delete a live package's dir and leave
         // dangling store metadata (package names are arbitrary Text).
         const pkgname = nm[65..];
+        // the generation-dir carve-out (step 3b): keep by FULL name — a
+        // dir named by a SURVIVING snapshot's generation fact is retained,
+        // and the decision is LOUD (a silent store-policy decision is how
+        // the config loss survived this long)
+        if (in_set(gen_dirs.items, nm)) {
+            err_print(
+                "fxstore: gc: keeping generation dir '{s}' — a surviving snapshot's generation fact names it\n",
+                .{nm},
+            );
+            continue;
+        }
         if (in_set(live, pkgname)) continue;
         if (pkgname.len > 4 and std.mem.eql(u8, pkgname[pkgname.len - 4 ..], "-src")) {
             if (in_set(live, pkgname[0 .. pkgname.len - 4])) continue;
+        }
+        if (std.mem.endsWith(u8, nm, "-system-generation")) {
+            err_print(
+                "fxstore: gc: reaping generation dir '{s}' — no surviving snapshot's generation fact names it\n",
+                .{nm},
+            );
         }
         var pb: [4 * FX_PATH_MAX]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ st.root(), nm }) catch continue;
@@ -1951,6 +2007,158 @@ test "fx_store_gc: liveness sweep, malformed report, orphan scratch sweep" {
     if (stale) |sp| try testing.expect(!is_dir(io, sp)); // dead pid: swept
     if (stale_legacy) |sp| try testing.expect(!is_dir(io, sp)); // legacy .tmp: swept
     try testing.expect(is_dir(io, live_pid_dir)); // live pid: never touched
+}
+
+// ─── fx_store_gc: the generation-dir carve-out ──────────────────────────────
+
+test "fx_store_gc: generation-dir carve-out — surviving snapshot's dir kept, pruned one's reaped" {
+    const io = tio();
+    var rb: [64:0]u8 = undefined;
+    const root = try temp_root(&rb);
+    defer cleanup_store(io, root);
+    var e = ErrBuf{};
+    const s = try fx_store_open(io, root, &e);
+    defer fx_store_close(s);
+    var eg = try EchoGuard.begin();
+    defer eg.release();
+
+    // one in-process package so the pinned snapshot has a gc root
+    var acts = [_]pkgs.Action{.{ .kind = .touch, .a = "made.txt" }};
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    var tbl = [_]Package{test_pkg("hello", &.{})};
+    tbl[0].recipe = &acts[0];
+    var pset: pkgs.PackageSet = .{ .arena = arena_inst };
+    link(&pset, &tbl);
+    var ce = cl.ErrBuf{};
+
+    // THREE candidate generation dirs: A is named by v1's fact, B by v2's,
+    // C by NO fact at all (a leftover / a foreign genhash).  generation is
+    // a CLEARED-per-activation relation, so v2 must carry only B's row —
+    // the same shape fx-activate writes.
+    const gen_a = "aa" ** 32;
+    const gen_b = "bb" ** 32;
+    const gen_c = "cc" ** 32;
+    var ab: [128:0]u8 = undefined;
+    var bb2: [128:0]u8 = undefined;
+    var cb: [128:0]u8 = undefined;
+    const dir_a = try std.fmt.bufPrintZ(&ab, "{s}/{s}-system-generation", .{ root, gen_a });
+    const dir_b = try std.fmt.bufPrintZ(&bb2, "{s}/{s}-system-generation", .{ root, gen_b });
+    const dir_c = try std.fmt.bufPrintZ(&cb, "{s}/{s}-system-generation", .{ root, gen_c });
+    var fb: [160]u8 = undefined;
+    const bf_a = try std.fmt.bufPrint(&fb, "{s}-system-generation/Dhakefile.dhall", .{gen_a});
+    var fb2: [160]u8 = undefined;
+    const bf_b = try std.fmt.bufPrint(&fb2, "{s}-system-generation/Dhakefile.dhall", .{gen_b});
+
+    // generation(genhash, buildfile_rel, dhake_rel, epoch) — arity 4, the
+    // writer's exact column shape (fx-activate); gc's carve-out reads
+    // cols[1] (buildfile_rel), so the trailing columns only need to intern
+    const gen_cols = struct {
+        fn f(db: *DlDb, gen: []const u8, bf: []const u8) ![4]u32 {
+            const gz = try testing.allocator.dupeZ(u8, gen);
+            defer testing.allocator.free(gz);
+            const bz = try testing.allocator.dupeZ(u8, bf);
+            defer testing.allocator.free(bz);
+            return [4]u32{
+                cl.dl_intern_str(db, gz.ptr),
+                cl.dl_intern_str(db, bz.ptr),
+                cl.dl_intern_str(db, bz.ptr),
+                cl.dl_intern_str(db, "1"),
+            };
+        }
+    }.f;
+    const addGen = struct {
+        fn f(db: *DlDb, gen: []const u8, bf: []const u8) !void {
+            const cols = try gen_cols(db, gen, bf);
+            try testing.expect(dl_txn_begin(db) == 0);
+            try testing.expect(dl_txn_add_fact(db, "generation", &cols, 4) == 0);
+            try testing.expect(dl_txn_commit(db) == 0);
+        }
+    }.f;
+    const delGen = struct {
+        fn f(db: *DlDb, gen: []const u8, bf: []const u8) !void {
+            const cols = try gen_cols(db, gen, bf);
+            try testing.expect(dl_txn_begin(db) == 0);
+            try testing.expect(dl_txn_delete_fact(db, "generation", &cols, 4) == 0);
+            try testing.expect(dl_txn_commit(db) == 0);
+        }
+    }.f;
+
+    // the relation must be DECLARED before facts land in it (fx-activate's
+    // own declare step; dl_declare_relation is idempotent)
+    try testing.expect(cl.dl_declare_relation(s.db, "generation", 4) == 0);
+
+    // v1: A's generation fact committed BEFORE the publish that creates
+    // v1, so generation is visible as-of v1 (the snapshot pins committed
+    // facts)
+    try addGen(s.db, gen_a, bf_a);
+    try cl.fx_closure_compute(s.db, &pset, &.{}, &ce); // publishes v1
+    // v2: clear A's row, add B's (the per-activation clear), publish
+    try delGen(s.db, gen_a, bf_a);
+    try addGen(s.db, gen_b, bf_b);
+    try fx_store_publish(s, &e); // v2
+
+    // the three dirs on disk (C's fact never existed)
+    try Io.Dir.cwd().createDirPath(io, dir_a);
+    try Io.Dir.cwd().createDirPath(io, dir_b);
+    try Io.Dir.cwd().createDirPath(io, dir_c);
+
+    var ob: [96:0]u8 = undefined;
+    var eb: [96:0]u8 = undefined;
+    const out_path = try std.fmt.bufPrintZ(&ob, "{s}.out", .{root});
+    const err_path = try std.fmt.bufPrintZ(&eb, "{s}.err", .{root});
+    var wb: [256]u8 = undefined;
+
+    // gc with BOTH versions surviving: A and B retained (each named by a
+    // surviving snapshot), C reaped (no fact names it — the keep is by
+    // FULL name, so an unrelated <hex>-system-generation dir is NOT
+    // blanket-kept), every decision LOUD on stderr
+    {
+        var cap = try Capture.begin(out_path, err_path);
+        cap.redirect();
+        try fx_store_gc(io, s, "hello", &e);
+        const out = try cap.end();
+        defer testing.allocator.free(out);
+        const errs = try cap.end_err();
+        defer testing.allocator.free(errs);
+        const want = try std.fmt.bufPrint(&wb, "fxstore gc: root 'hello' — 0 store fact(s) and 1 dir(s) removed (1 live package name(s))\n", .{});
+        try testing.expect(std.mem.indexOf(u8, out, want) != null);
+        const keep_a = try std.fmt.bufPrint(&wb, "fxstore: gc: keeping generation dir '{s}-system-generation' — a surviving snapshot's generation fact names it\n", .{gen_a});
+        try testing.expect(std.mem.indexOf(u8, errs, keep_a) != null);
+        const keep_b = try std.fmt.bufPrint(&wb, "fxstore: gc: keeping generation dir '{s}-system-generation' — a surviving snapshot's generation fact names it\n", .{gen_b});
+        try testing.expect(std.mem.indexOf(u8, errs, keep_b) != null);
+        const reap_c = try std.fmt.bufPrint(&wb, "fxstore: gc: reaping generation dir '{s}-system-generation' — no surviving snapshot's generation fact names it\n", .{gen_c});
+        try testing.expect(std.mem.indexOf(u8, errs, reap_c) != null);
+    }
+    try testing.expect(is_dir(io, dir_a)); // v1 (surviving) names it
+    try testing.expect(is_dir(io, dir_b)); // v2 (surviving) names it
+    try testing.expect(!is_dir(io, dir_c)); // no fact names it: swept
+
+    // prune to the newest snapshot only (gc --retain 1): v1 — and A's
+    // generation fact with it — is gone; the prune publish carries only
+    // B's row, so the prune is visible to the dir sweep's as-of reads
+    try fx_store_gc_retain(io, s, 1, &e);
+
+    // and the sweep after the prune: A's dir is now REAPABLE (no surviving
+    // snapshot names it), B's still retained — the carve-out is PRECISE,
+    // not a blanket keep
+    {
+        var cap = try Capture.begin(out_path, err_path);
+        cap.redirect();
+        try fx_store_gc(io, s, "hello", &e);
+        const out = try cap.end();
+        defer testing.allocator.free(out);
+        const errs = try cap.end_err();
+        defer testing.allocator.free(errs);
+        const want = try std.fmt.bufPrint(&wb, "fxstore gc: root 'hello' — 0 store fact(s) and 1 dir(s) removed (1 live package name(s))\n", .{});
+        try testing.expect(std.mem.indexOf(u8, out, want) != null);
+        const reap_a = try std.fmt.bufPrint(&wb, "fxstore: gc: reaping generation dir '{s}-system-generation' — no surviving snapshot's generation fact names it\n", .{gen_a});
+        try testing.expect(std.mem.indexOf(u8, errs, reap_a) != null);
+        const keep_b = try std.fmt.bufPrint(&wb, "fxstore: gc: keeping generation dir '{s}-system-generation' — a surviving snapshot's generation fact names it\n", .{gen_b});
+        try testing.expect(std.mem.indexOf(u8, errs, keep_b) != null);
+    }
+    try testing.expect(!is_dir(io, dir_a)); // its snapshot was pruned: reaped
+    try testing.expect(is_dir(io, dir_b)); // the surviving snapshot names it
 }
 
 // ─── fx_store_current_version + fx_store_timeline ───────────────────────────
