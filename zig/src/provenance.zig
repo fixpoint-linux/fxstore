@@ -360,9 +360,10 @@ pub const RelSchema = struct {
 
 /// Every fact relation a writer in this stack declares, with each column's
 /// kind.  MEASURED census of the writers: fx-activate declares
-/// generation/svc/svc_argv/svc_env/svc_probe/svc_bin/svc_backoff/
-/// svc_console/user/tool_fxstore/boot_grace/install/provides/activate_root
-/// (activate.zig:1208-1223) and src_of a3, all-sym, in commitClosureMeta
+/// generation/generation_config/svc/svc_argv/svc_env/svc_probe/svc_bin/
+/// svc_backoff/svc_console/user/tool_fxstore/boot_grace/install/provides/
+/// activate_root (activate.zig:1208-1223) and src_of a3, all-sym, in
+/// commitClosureMeta
 /// (activate.zig — the deriv-hash -> src-hash binding beside the
 /// store/srcstore pair); fxstore's own snapshots carry pkg/dep/root
 /// (closure.zig), store/srcstore (store.zig:320-327).  The raw-u32 columns:
@@ -378,6 +379,7 @@ pub const RELATION_SCHEMAS = [_]RelSchema{
     .{ .name = "boot_grace", .arity = 1, .cols = &.{.raw} },
     .{ .name = "dep", .arity = 2, .cols = &.{ .sym, .sym } },
     .{ .name = "generation", .arity = 4, .cols = &.{ .sym, .sym, .sym, .raw } },
+    .{ .name = "generation_config", .arity = 3, .cols = &.{ .sym, .sym, .sym } },
     .{ .name = "install", .arity = 4, .cols = &.{ .sym, .sym, .raw, .sym } },
     .{ .name = "pkg", .arity = 1, .cols = &.{.sym} },
     .{ .name = "provides", .arity = 2, .cols = &.{ .sym, .sym } },
