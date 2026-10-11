@@ -650,7 +650,11 @@ pub fn prov_why(db: ?*DlDb, pkg: []const u8, v: Version, e: *ProvErrBuf) ProvErr
     for (0..ibag.n) |i| {
         const t = ibag.tuples.items[i * 4 ..][0..4];
         const origin = try sym_name(a, d, t[1], e);
-        if (!std.mem.eql(u8, origin, store_dir)) continue;
+        // origin names the exact installed content (`<hash>-<pkg>/<binary>`
+        // for bin links), so match its FIRST path segment against the
+        // provides store_dir — the same rule prov_what uses above.
+        const seg = if (std.mem.indexOfScalar(u8, origin, '/')) |slash| origin[0..slash] else origin;
+        if (!std.mem.eql(u8, seg, store_dir)) continue;
         targets.append(a, try sym_name(a, d, t[0], e)) catch
             return e.set("out of memory", .{});
     }
@@ -700,7 +704,7 @@ pub fn prov_free_why(r: WhyResult) void {
 /// Indented proof tree for a what-answer:
 ///
 ///     /bin/hello
-///       <- origin <hash>-hello (mode 0o0, generation <genhash>)
+///       <- origin <hash>-hello/hello (mode 0o0, generation <genhash>)
 ///         <- package hello
 ///           <- pulled by root 'world'
 ///
@@ -1080,8 +1084,11 @@ fn activate(db: *DlDb) !void {
     var b5: [128:0]u8 = undefined;
     var b6: [128:0]u8 = undefined;
 
-    try F.install(db, zify(&b1, "/bin/hello"), zify(&b2, ha ++ "-hello"), 0, gen);
-    try F.install(db, zify(&b3, "/bin/world"), zify(&b4, hb ++ "-world"), 0, gen);
+    // bin links: origin is the EXACT installed content `<hash>-<pkg>/<binary>`
+    // — the same path the buildfile's Symlink points at (activate.zig's bin
+    // loop).  Its first path segment is the provides store dir below.
+    try F.install(db, zify(&b1, "/bin/hello"), zify(&b2, ha ++ "-hello/hello"), 0, gen);
+    try F.install(db, zify(&b3, "/bin/world"), zify(&b4, hb ++ "-world/world"), 0, gen);
     try F.install(db, "/etc/motd", zify(&b4, gen ++ "-system-generation/etc/motd"), 0o644, gen);
     try F.install(db, "/etc/hosts", zify(&b2, gen ++ "-system-generation/etc/hosts"), 0o644, gen);
     try F.provides(db, "hello", zify(&b5, ha ++ "-hello"));
@@ -1156,7 +1163,7 @@ fn activate_gen2(db: *DlDb) !void {
     try F.ss(db, "svc_bin", zify(&b1, "heartbeat"), zify(&b5, hb2 ++ "/fakesvc"));
     try F.ss(db, "svc_bin", zify(&b1, "shell"), zify(&b6, "/bin/sh"));
     // the extra install/provides/srcstore/store rows (the v2-vs-v3 delta)
-    try F.install(db, zify(&b1, "/bin/fakesvc"), zify(&b2, hb2 ++ "-fake-service"), 0, gen);
+    try F.install(db, zify(&b1, "/bin/fakesvc"), zify(&b2, hb2 ++ "-fake-service/fakesvc"), 0, gen);
     try F.ss(db, "provides", zify(&b1, "fake-service"), zify(&b3, hb2 ++ "-fake-service"));
     try F.ss(db, "srcstore", zify(&b2, hb2), zify(&b1, "fake-service"));
     try F.ss(db, "store", zify(&b2, hb2), zify(&b1, "fake-service"));
@@ -1197,11 +1204,11 @@ test "prov_what: current + as-of, pkg resolution, pullers, error paths" {
     try testing.expectError(error.FxProv, prov_what(null, "/bin/hello", .current, &e));
     try testing.expectEqualStrings("internal: null db", e.slice());
 
-    // bin symlink: origin IS the pkg store dir -> pkg + pullers
+    // bin symlink: origin's first segment IS the pkg store dir -> pkg + pullers
     const r = try prov_what(db, "/bin/hello", .current, &e);
     defer prov_free_what(r);
     try testing.expectEqualStrings("/bin/hello", r.target);
-    try testing.expectEqualStrings(ha ++ "-hello", r.origin);
+    try testing.expectEqualStrings(ha ++ "-hello/hello", r.origin);
     try testing.expectEqual(@as(u32, 0), r.mode);
     try testing.expectEqualStrings(gen, r.genhash);
     try testing.expectEqualStrings("hello", r.pkg.?);
@@ -1359,7 +1366,7 @@ test "prov_render_what / prov_render_why: indented proof trees" {
     try prov_render_what(&aw.writer, &r);
     const want_what =
         "/bin/hello\n" ++
-        "  <- origin " ++ ha ++ "-hello (mode 0o0, generation " ++ gen ++ ")\n" ++
+        "  <- origin " ++ ha ++ "-hello/hello (mode 0o0, generation " ++ gen ++ ")\n" ++
         "    <- package hello\n" ++
         "      <- pulled by root 'hello'\n" ++
         "      <- pulled by root 'world'\n";
@@ -1419,16 +1426,24 @@ test "prov_verify: drift taxonomy + clean rootfs + old-snapshot absent-as-empty"
     try testing.expectError(error.FxProv, prov_verify(io, null, "/", "/", .current, &e, &drifts));
     try testing.expectEqualStrings("internal: null db", e.slice());
 
-    // a fake store (dirs the symlinks point into) + a rootfs
+    // a fake store (the pkg dirs + the binaries the symlinks point into) + a rootfs
     var sr_buf: [64:0]u8 = undefined;
     const store = try temp_dir(&sr_buf, "store");
     defer Io.Dir.cwd().deleteTree(io, store) catch {};
-    var hb1: [160:0]u8 = undefined;
-    var hb2: [160:0]u8 = undefined;
+    var hb1: [192:0]u8 = undefined;
+    var hb2: [192:0]u8 = undefined;
+    var k1: [192:0]u8 = undefined;
+    var k2: [192:0]u8 = undefined;
     const dir_hello = try std.fmt.bufPrintZ(&hb1, "{s}/{s}-hello", .{ store, ha });
     const dir_world = try std.fmt.bufPrintZ(&hb2, "{s}/{s}-world", .{ store, hb });
     try Io.Dir.cwd().createDirPath(io, dir_hello);
     try Io.Dir.cwd().createDirPath(io, dir_world);
+    // the link TARGET is the binary inside the pkg dir (a dir symlink is
+    // un-exec-able) — exactly what the install origin now names.
+    const bin_hello = try std.fmt.bufPrintZ(&k1, "{s}/hello", .{dir_hello});
+    const bin_world = try std.fmt.bufPrintZ(&k2, "{s}/world", .{dir_world});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = bin_hello, .data = "#!/bin/sh\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = bin_world, .data = "#!/bin/sh\n" });
 
     var rf_buf: [64:0]u8 = undefined;
     const rootfs = try temp_dir(&rf_buf, "rootfs");
@@ -1445,8 +1460,8 @@ test "prov_verify: drift taxonomy + clean rootfs + old-snapshot absent-as-empty"
     var l2: [128:0]u8 = undefined;
     const link_hello = try std.fmt.bufPrintZ(&l1, "{s}/bin/hello", .{rootfs});
     const link_world = try std.fmt.bufPrintZ(&l2, "{s}/bin/world", .{rootfs});
-    try Io.Dir.cwd().symLink(io, dir_hello, link_hello, .{});
-    try Io.Dir.cwd().symLink(io, dir_world, link_world, .{});
+    try Io.Dir.cwd().symLink(io, bin_hello, link_hello, .{});
+    try Io.Dir.cwd().symLink(io, bin_world, link_world, .{});
     var f1: [128:0]u8 = undefined;
     var f2: [128:0]u8 = undefined;
     const motd = try std.fmt.bufPrintZ(&f1, "{s}/etc/motd", .{rootfs});
@@ -1563,12 +1578,18 @@ test "prov_verify: etc-copy content-hash drift (U5)" {
     var sr_buf: [64:0]u8 = undefined;
     const store = try temp_dir(&sr_buf, "store");
     defer Io.Dir.cwd().deleteTree(io, store) catch {};
-    var hb1: [160:0]u8 = undefined;
-    var hb2: [160:0]u8 = undefined;
+    var hb1: [192:0]u8 = undefined;
+    var hb2: [192:0]u8 = undefined;
     const dir_hello = try std.fmt.bufPrintZ(&hb1, "{s}/{s}-hello", .{ store, ha });
     const dir_world = try std.fmt.bufPrintZ(&hb2, "{s}/{s}-world", .{ store, hb });
     try Io.Dir.cwd().createDirPath(io, dir_hello);
     try Io.Dir.cwd().createDirPath(io, dir_world);
+    var k1: [192:0]u8 = undefined;
+    var k2: [192:0]u8 = undefined;
+    const bin_hello = try std.fmt.bufPrintZ(&k1, "{s}/hello", .{dir_hello});
+    const bin_world = try std.fmt.bufPrintZ(&k2, "{s}/world", .{dir_world});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = bin_hello, .data = "#!/bin/sh\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = bin_world, .data = "#!/bin/sh\n" });
     var gb: [160:0]u8 = undefined;
     const gen_etc = try std.fmt.bufPrintZ(&gb, "{s}/{s}-system-generation/etc", .{ store, gen });
     try Io.Dir.cwd().createDirPath(io, gen_etc);
@@ -1593,8 +1614,8 @@ test "prov_verify: etc-copy content-hash drift (U5)" {
     var l2: [128:0]u8 = undefined;
     const link_hello = try std.fmt.bufPrintZ(&l1, "{s}/bin/hello", .{rootfs});
     const link_world = try std.fmt.bufPrintZ(&l2, "{s}/bin/world", .{rootfs});
-    try Io.Dir.cwd().symLink(io, dir_hello, link_hello, .{});
-    try Io.Dir.cwd().symLink(io, dir_world, link_world, .{});
+    try Io.Dir.cwd().symLink(io, bin_hello, link_hello, .{});
+    try Io.Dir.cwd().symLink(io, bin_world, link_world, .{});
     var f1: [128:0]u8 = undefined;
     var f2: [128:0]u8 = undefined;
     const motd = try std.fmt.bufPrintZ(&f1, "{s}/etc/motd", .{rootfs});
@@ -1733,8 +1754,8 @@ test "prov_facts: symbols resolve, raw u32 prints decimal, --as-of BINDS, unknow
     try testing.expectEqual(@as(u8, 4), r2.arity);
     try testing.expectEqual(@as(usize, 4), r2.rows.len);
     const want2 =
-        "/bin/hello\t" ++ ha ++ "-hello\t0\t" ++ gen ++ "\n" ++
-        "/bin/world\t" ++ hb ++ "-world\t0\t" ++ gen ++ "\n" ++
+        "/bin/hello\t" ++ ha ++ "-hello/hello\t0\t" ++ gen ++ "\n" ++
+        "/bin/world\t" ++ hb ++ "-world/world\t0\t" ++ gen ++ "\n" ++
         "/etc/hosts\t" ++ gen ++ "-system-generation/etc/hosts\t420\t" ++ gen ++ "\n" ++
         "/etc/motd\t" ++ gen ++ "-system-generation/etc/motd\t420\t" ++ gen ++ "\n";
     try testing.expectEqualStrings(want2, try facts_lines_sorted(a, &r2));
@@ -1749,7 +1770,7 @@ test "prov_facts: symbols resolve, raw u32 prints decimal, --as-of BINDS, unknow
     // v3's install = v2's four lines PLUS the new fact: the delta is the
     // binding witness, and it proves reading v3 did not disturb v2's read.
     const hc = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    const want3 = "/bin/fakesvc\t" ++ hc ++ "-fake-service\t0\t" ++ gen ++ "\n" ++ want2;
+    const want3 = "/bin/fakesvc\t" ++ hc ++ "-fake-service/fakesvc\t0\t" ++ gen ++ "\n" ++ want2;
     try testing.expectEqualStrings(want3, try facts_lines_sorted(a, &r3));
 
     const b2 = try prov_facts(db, "svc_bin", .{ .as_of = 2 }, &e);

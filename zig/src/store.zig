@@ -2437,6 +2437,8 @@ test "fx_store_rollback: snapshot-complete swap restores every recorded relation
         try testing.expectEqual(@as(c_int, 0), dl_txn_begin(db));
         try F.del_boot_grace(db, 30000);
         try F.boot_grace(db, 15000);
+        // install origins here are OPAQUE payloads (line-compared only, no
+        // provider resolution) — the dir shape is deliberate, not the writer's
         try F.install(db, "/bin/hello", ha ++ "-hello", 0, gen);
         try F.install(db, "/etc/motd", gen ++ "-system-generation/etc/motd", 0o644, gen);
         try F.provides(db, "hello", ha ++ "-hello");
